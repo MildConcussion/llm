@@ -327,7 +327,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs,
             scaler.scale(loss).backward()
 
             if (i + 1) % gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer.optimizer)
+                scaler.unscale_(optimizer.base_optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
