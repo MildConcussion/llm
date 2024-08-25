@@ -27,15 +27,20 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.backends.mps.enable_ddp = True
 
 class GROKFAST(Optimizer):
-    def __init__(self, optimizer, alpha=0.9, lambda_factor=0.1):
-        self.optimizer = optimizer
+    def __init__(self, params, base_optimizer, alpha=0.9, lambda_factor=0.1):
+        self.base_optimizer = base_optimizer
         self.alpha = alpha
         self.lambda_factor = lambda_factor
+        super(GROKFAST, self).__init__(params, {})
+
         self.state = defaultdict(dict)
+        for group in self.param_groups:
+            for p in group['params']:
+                self.state[p]['mu'] = torch.zeros_like(p.data)
 
     def __getstate__(self):
         return {
-            'optimizer': self.optimizer,
+            'base_optimizer': self.base_optimizer,
             'alpha': self.alpha,
             'lambda_factor': self.lambda_factor,
             'state': self.state,
@@ -51,16 +56,12 @@ class GROKFAST(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.optimizer.param_groups:
+        for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
 
                 state = self.state[p]
-
-                # Initialize mu if it doesn't exist
-                if 'mu' not in state:
-                    state['mu'] = torch.zeros_like(p.data)
 
                 # Calculate EMA of gradients
                 state['mu'].mul_(self.alpha).add_(p.grad, alpha=1 - self.alpha)
@@ -71,13 +72,13 @@ class GROKFAST(Optimizer):
                 # Replace the original gradient with the filtered gradient
                 p.grad.copy_(filtered_grad)
 
-        # Call the wrapped optimizer's step function
-        self.optimizer.step()
+        # Call the base optimizer's step function
+        self.base_optimizer.step()
 
         return loss
 
     def zero_grad(self, set_to_none: bool = False):
-        self.optimizer.zero_grad(set_to_none)
+        self.base_optimizer.zero_grad(set_to_none)
 
 class SimpleAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
@@ -318,7 +319,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs,
             attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
-            with autocast(enabled=device.type == 'cuda'):
+            with autocast(device_type='cuda', enabled=device.type == 'cuda'):
                 outputs = model(input_ids)
                 loss = F.cross_entropy(outputs.view(-1, model.fc.out_features), labels.view(-1), ignore_index=-100)
                 loss = loss / gradient_accumulation_steps
@@ -326,7 +327,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs,
             scaler.scale(loss).backward()
 
             if (i + 1) % gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer.optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -370,22 +371,6 @@ def validate(model, val_loader, device):
 
     return val_loss / len(val_loader)
 
-@torch.inference_mode()
-def generate(model, tokenizer, prompt, max_tokens=50):
-    model.eval()
-    device = next(model.parameters()).device
-    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
-
-    for _ in range(max_tokens):
-        outputs = model(input_ids)
-        next_token_logits = outputs[:, -1, :]
-        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
-        input_ids = torch.cat([input_ids, next_token], dim=-1)
-
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-    return tokenizer.decode(input_ids[0])
 
 def main():
     vocab_size = 50257
@@ -432,11 +417,15 @@ def main():
     val_loader = prepare_dataset(tokenizer, max_seq_len, batch_size, split='test')
 
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay)
-    optimizer = GROKFAST(base_optimizer, alpha=grokfast_alpha, lambda_factor=grokfast_lambda)
+    optimizer = GROKFAST(model.parameters(), base_optimizer, alpha=grokfast_alpha, lambda_factor=grokfast_lambda)
+
+    # Update the scheduler to use the base_optimizer
+
 
     total_steps = len(train_loader) * epochs // gradient_accumulation_steps
     warmup_steps = total_steps // 10  # 10% of total steps for warmup
-    scheduler = get_linear_schedule_with_warmup(optimizer.optimizer, warmup_steps, total_steps)
+
+    scheduler = get_linear_schedule_with_warmup(base_optimizer, warmup_steps, total_steps)
 
     train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps)
 
