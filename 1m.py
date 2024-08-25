@@ -243,15 +243,18 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
-def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer, scheduler, epochs, gradient_accumulation_steps=4):
+def train_parallel(rank, world_size, model, train_dataset, val_dataset, optimizer, scheduler, epochs, gradient_accumulation_steps, batch_size, max_seq_len):
     setup(rank, world_size)
 
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model = DDP(model, device_ids=[rank])
 
-    train_loader = create_distributed_dataloader(train_dataset, batch_size, rank, world_size, shuffle=True)
-    val_loader = create_distributed_dataloader(val_dataset, batch_size, rank, world_size, shuffle=False)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
 
     scaler = GradScaler()
     model.train()
@@ -260,6 +263,7 @@ def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer,
     no_improve = 0
 
     for epoch in range(epochs):
+        train_sampler.set_epoch(epoch)
         total_loss = 0
         optimizer.zero_grad()
         for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", disable=rank != 0)):
@@ -473,23 +477,15 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs,
             attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
-            def forward_pass(input_ids):
-                # Apply checkpointing to the transformer blocks
-                hidden_states = model.embedding(input_ids)
-                hidden_states = checkpoint_sequential(model.transformer_blocks, len(model.transformer_blocks), hidden_states)
-                hidden_states = model.ln_f(hidden_states)
-                logits = model.fc(hidden_states)
-                return logits
-
             with autocast(enabled=device.type == 'cuda'):
-                outputs = forward_pass(input_ids)
+                outputs = model(input_ids)
                 loss = F.cross_entropy(outputs.view(-1, model.fc.out_features), labels.view(-1), ignore_index=-100)
                 loss = loss / gradient_accumulation_steps
 
             scaler.scale(loss).backward()
 
             if (i + 1) % gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer.base_optimizer)
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -573,25 +569,26 @@ def main():
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     print(f"Using device: {device}")
 
-    train_dataset = prepare_dataset(tokenizer, max_seq_len, batch_size, split='train')
-    val_dataset = prepare_dataset(tokenizer, max_seq_len, batch_size, split='test')
+    # Prepare datasets
+    train_dataset = NeurIPSLLMDataset(pd.read_json("hf://datasets/upaya07/NeurIPS-LLM-data/train_dataset.json"), tokenizer, max_seq_len)
+    val_dataset = NeurIPSLLMDataset(pd.read_json("hf://datasets/upaya07/NeurIPS-LLM-data/eval_dataset.json"), tokenizer, max_seq_len)
 
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay)
     optimizer = GROKFAST(model.parameters(), base_optimizer, alpha=grokfast_alpha, lambda_factor=grokfast_lambda)
 
-    total_steps = len(train_dataset) * epochs // gradient_accumulation_steps
+    # Calculate total_steps based on the length of the dataset
+    total_steps = (len(train_dataset) // batch_size) * epochs // gradient_accumulation_steps
     warmup_steps = total_steps // 10
 
     scheduler = LinearWarmupCosineAnnealingLR(optimizer.base_optimizer, warmup_steps, total_steps)
 
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        mp.spawn(train_parallel, args=(world_size, model, train_dataset, val_dataset, optimizer, scheduler, epochs, gradient_accumulation_steps), nprocs=world_size, join=True)
+        mp.spawn(train_parallel, args=(world_size, model, train_dataset, val_dataset, optimizer, scheduler, epochs, gradient_accumulation_steps, batch_size, max_seq_len), nprocs=world_size, join=True)
     else:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps)
-
 
     prompt = "Question: What is the meaning of life?\nAnswer:"
     generated_text = generate(model, tokenizer, prompt, device)
