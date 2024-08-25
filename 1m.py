@@ -89,9 +89,11 @@ class GROKFAST(Optimizer):
 
                 state = self.state[p]
 
-                # Ensure mu is on the same device as p
+                # Ensure mu is on the same device as p and p.grad
                 if 'mu' not in state:
                     state['mu'] = torch.zeros_like(p.data)
+                elif state['mu'].device != p.device:
+                    state['mu'] = state['mu'].to(p.device)
 
                 # Calculate EMA of gradients
                 state['mu'].mul_(self.alpha).add_(p.grad, alpha=1 - self.alpha)
@@ -249,6 +251,12 @@ def train_parallel(rank, world_size, model, train_dataset, val_dataset, optimize
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model = DDP(model, device_ids=[rank])
+
+    # Move optimizer states to the correct device
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
