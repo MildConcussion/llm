@@ -8,6 +8,11 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint_sequential
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
@@ -167,10 +172,116 @@ class SimpleLLM(nn.Module):
     def forward(self, x):
         x = self.embedding(x)
         for block in self.transformer_blocks:
+            x = checkpoint(block, x)
+        x = self.ln_f(x)
+        logits = self.fc(x)
+        return logits
+
+class ParallelSimpleLLM(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_heads, ff_dim, num_layers, max_seq_len):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, ff_dim) for _ in range(num_layers)
+        ])
+        self.ln_f = nn.LayerNorm(embed_dim)
+        self.fc = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        for block in self.transformer_blocks:
             x = block(x)
         x = self.ln_f(x)
         logits = self.fc(x)
         return logits
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer, scheduler, epochs, gradient_accumulation_steps=4):
+    setup(rank, world_size)
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model = DDP(model, device_ids=[rank])
+
+    scaler = GradScaler()
+    model.train()
+    best_val_loss = float('inf')
+    patience = 3
+    no_improve = 0
+
+    for epoch in range(epochs):
+        total_loss = 0
+        optimizer.zero_grad()
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", disable=rank != 0)):
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
+
+            with autocast(enabled=device.type == 'cuda'):
+                outputs = model(input_ids)
+                loss = F.cross_entropy(outputs.view(-1, model.module.fc.out_features), labels.view(-1), ignore_index=-100)
+                loss = loss / gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+
+            if (i + 1) % gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer.base_optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * gradient_accumulation_steps
+
+        avg_loss = total_loss / len(train_loader)
+        if rank == 0:
+            print(f"Epoch {epoch+1}, Average Train Loss: {avg_loss:.4f}")
+
+        val_loss = validate_parallel(model, val_loader, device)
+        if rank == 0:
+            print(f"Epoch {epoch+1}, Average Validation Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            no_improve = 0
+            if rank == 0:
+                torch.save(model.module.state_dict(), "best_model.pth")
+        else:
+            no_improve += 1
+
+        if no_improve >= patience:
+            if rank == 0:
+                print("Early stopping!")
+            break
+
+        model.train()
+
+    cleanup()
+
+def validate_parallel(model, val_loader, device):
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
+
+            with autocast(enabled=device.type == 'cuda'):
+                outputs = model(input_ids)
+                loss = F.cross_entropy(outputs.view(-1, model.module.fc.out_features), labels.view(-1), ignore_index=-100)
+            val_loss += loss.item()
+
+    return val_loss / len(val_loader)
+
 
 class NeurIPSLLMDataset(Dataset):
     def __init__(self, dataframe, tokenizer, max_length):
@@ -305,7 +416,7 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps=4):
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=(device.type == 'cuda'))
     model.train()
     best_val_loss = float('inf')
     patience = 3
@@ -319,8 +430,16 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs,
             attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
+            def forward_pass(input_ids):
+                # Apply checkpointing to the transformer blocks
+                hidden_states = model.embedding(input_ids)
+                hidden_states = checkpoint_sequential(model.transformer_blocks, len(model.transformer_blocks), hidden_states)
+                hidden_states = model.ln_f(hidden_states)
+                logits = model.fc(hidden_states)
+                return logits
+
             with autocast(enabled=device.type == 'cuda'):
-                outputs = model(input_ids)
+                outputs = forward_pass(input_ids)
                 loss = F.cross_entropy(outputs.view(-1, model.fc.out_features), labels.view(-1), ignore_index=-100)
                 loss = loss / gradient_accumulation_steps
 
@@ -394,7 +513,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
-    model = SimpleLLM(vocab_size, embed_dim, num_heads, ff_dim, num_layers, max_seq_len)
+    model = ParallelSimpleLLM(vocab_size, embed_dim, num_heads, ff_dim, num_layers, max_seq_len)
 
     # Check if CUDA is available, otherwise use MPS or CPU
     if torch.cuda.is_available():
@@ -419,15 +538,16 @@ def main():
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay)
     optimizer = GROKFAST(model.parameters(), base_optimizer, alpha=grokfast_alpha, lambda_factor=grokfast_lambda)
 
-    # Update the scheduler to use the base_optimizer
-
-
     total_steps = len(train_loader) * epochs // gradient_accumulation_steps
     warmup_steps = total_steps // 10  # 10% of total steps for warmup
+    scheduler = get_linear_schedule_with_warmup(optimizer.base_optimizer, warmup_steps, total_steps)
 
-    scheduler = get_linear_schedule_with_warmup(base_optimizer, warmup_steps, total_steps)
+    world_size = torch.cuda.device_count()
+    if world_size > 1:
+        mp.spawn(train_parallel, args=(world_size, model, train_loader, val_loader, optimizer, scheduler, epochs, gradient_accumulation_steps), nprocs=world_size, join=True)
+    else:
+        train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps)
 
-    train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps)
 
     prompt = "Question: What is the meaning of life?\nAnswer:"
     generated_text = generate(model, tokenizer, prompt, device)
