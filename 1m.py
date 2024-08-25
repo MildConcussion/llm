@@ -51,6 +51,10 @@ class GROKFAST(Optimizer):
         self.base_optimizer = base_optimizer
         self.alpha = alpha
         self.lambda_factor = lambda_factor
+
+        # Initialize param_groups from base_optimizer
+        self.param_groups = base_optimizer.param_groups
+
         super(GROKFAST, self).__init__(params, {})
 
         self.state = defaultdict(dict)
@@ -64,6 +68,7 @@ class GROKFAST(Optimizer):
             'alpha': self.alpha,
             'lambda_factor': self.lambda_factor,
             'state': self.state,
+            'param_groups': self.param_groups,
         }
 
     def __setstate__(self, state):
@@ -100,6 +105,21 @@ class GROKFAST(Optimizer):
     def zero_grad(self, set_to_none: bool = False):
         self.base_optimizer.zero_grad(set_to_none)
 
+    # Add this method to ensure compatibility with PyTorch optimizers
+    def state_dict(self):
+        return {
+            'base_optimizer': self.base_optimizer.state_dict(),
+            'alpha': self.alpha,
+            'lambda_factor': self.lambda_factor,
+            'state': self.state,
+        }
+
+    # Add this method to ensure compatibility with PyTorch optimizers
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict['base_optimizer'])
+        self.alpha = state_dict['alpha']
+        self.lambda_factor = state_dict['lambda_factor']
+        self.state = state_dict['state']
 class SimpleAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super().__init__()
@@ -247,7 +267,7 @@ def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer,
             scaler.scale(loss).backward()
 
             if (i + 1) % gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer.base_optimizer)
+                scaler.unscale_(optimizer.base_optimizer)  # Use base_optimizer here
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
