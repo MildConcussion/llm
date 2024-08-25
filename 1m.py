@@ -24,6 +24,7 @@ import random
 from collections import defaultdict
 import pandas as pd
 from torch.optim.lr_scheduler import _LRScheduler
+from torch.utils.data.distributed import DistributedSampler
 
 class LinearWarmupCosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-8, last_epoch=-1):
@@ -87,6 +88,10 @@ class GROKFAST(Optimizer):
                     continue
 
                 state = self.state[p]
+
+                # Ensure mu is on the same device as p
+                if 'mu' not in state:
+                    state['mu'] = torch.zeros_like(p.data)
 
                 # Calculate EMA of gradients
                 state['mu'].mul_(self.alpha).add_(p.grad, alpha=1 - self.alpha)
@@ -245,6 +250,9 @@ def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer,
     model = model.to(device)
     model = DDP(model, device_ids=[rank])
 
+    train_loader = create_distributed_dataloader(train_dataset, batch_size, rank, world_size, shuffle=True)
+    val_loader = create_distributed_dataloader(val_dataset, batch_size, rank, world_size, shuffle=False)
+
     scaler = GradScaler()
     model.train()
     best_val_loss = float('inf')
@@ -267,7 +275,7 @@ def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer,
             scaler.scale(loss).backward()
 
             if (i + 1) % gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer.base_optimizer)  # Use base_optimizer here
+                scaler.unscale_(optimizer.base_optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -288,7 +296,7 @@ def train_parallel(rank, world_size, model, train_loader, val_loader, optimizer,
             best_val_loss = val_loss
             no_improve = 0
             if rank == 0:
-                torch.save(model.module.state_dict(), "best_model.pth")
+                torch.save(model.module.state_dict(), f"best_model_rank_{rank}.pth")
         else:
             no_improve += 1
 
@@ -525,6 +533,10 @@ def validate(model, val_loader, device):
 
     return val_loss / len(val_loader)
 
+def create_distributed_dataloader(dataset, batch_size, rank, world_size, shuffle=True):
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=4, pin_memory=True)
+
 
 def main():
     vocab_size = 50257
@@ -561,22 +573,25 @@ def main():
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     print(f"Using device: {device}")
 
-    train_loader = prepare_dataset(tokenizer, max_seq_len, batch_size, split='train')
-    val_loader = prepare_dataset(tokenizer, max_seq_len, batch_size, split='test')
+    train_dataset = prepare_dataset(tokenizer, max_seq_len, batch_size, split='train')
+    val_dataset = prepare_dataset(tokenizer, max_seq_len, batch_size, split='test')
 
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay)
     optimizer = GROKFAST(model.parameters(), base_optimizer, alpha=grokfast_alpha, lambda_factor=grokfast_lambda)
 
-    total_steps = len(train_loader) * epochs // gradient_accumulation_steps
+    total_steps = len(train_dataset) * epochs // gradient_accumulation_steps
     warmup_steps = total_steps // 10
 
     scheduler = LinearWarmupCosineAnnealingLR(optimizer.base_optimizer, warmup_steps, total_steps)
 
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        mp.spawn(train_parallel, args=(world_size, model, train_loader, val_loader, optimizer, scheduler, epochs, gradient_accumulation_steps), nprocs=world_size, join=True)
+        mp.spawn(train_parallel, args=(world_size, model, train_dataset, val_dataset, optimizer, scheduler, epochs, gradient_accumulation_steps), nprocs=world_size, join=True)
     else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps)
+
 
     prompt = "Question: What is the meaning of life?\nAnswer:"
     generated_text = generate(model, tokenizer, prompt, device)
