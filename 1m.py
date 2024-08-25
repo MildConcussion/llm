@@ -319,7 +319,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, epochs,
             attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
-            with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+            with autocast(enabled=device.type == 'cuda'):
                 outputs = model(input_ids)
                 loss = F.cross_entropy(outputs.view(-1, model.fc.out_features), labels.view(-1), ignore_index=-100)
                 loss = loss / gradient_accumulation_steps
