@@ -23,7 +23,22 @@ import os
 import random
 from collections import defaultdict
 import pandas as pd
+from torch.optim.lr_scheduler import _LRScheduler
 
+class LinearWarmupCosineAnnealingLR(_LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-8, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * (self.last_epoch + 1) / self.warmup_steps for base_lr in self.base_lrs]
+        else:
+            progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            return [self.min_lr + 0.5 * (base_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
+                    for base_lr in self.base_lrs]
 
 # Set the environment variable to disable tokenizer parallelism
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -500,25 +515,19 @@ def main():
     max_seq_len = 512
     batch_size = 32
     learning_rate = 2e-4
-    epochs = 20  # Increased number of epochs
-    subset_size = None  # Increased subset size
+    epochs = 20
     gradient_accumulation_steps = 4
 
-    # GROKFAST hyperparameters
     grokfast_alpha = 0.9
     grokfast_lambda = 0.1
-
-    # Optimal weight decay as per the paper
-    weight_decay = 0.01  # This value showed ×3.72 faster generalization
+    weight_decay = 0.01
 
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
     model = ParallelSimpleLLM(vocab_size, embed_dim, num_heads, ff_dim, num_layers, max_seq_len)
 
-    # Check if CUDA is available, otherwise use MPS or CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        # Enable TF32 on Ampere GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     elif torch.backends.mps.is_available():
@@ -539,15 +548,15 @@ def main():
     optimizer = GROKFAST(model.parameters(), base_optimizer, alpha=grokfast_alpha, lambda_factor=grokfast_lambda)
 
     total_steps = len(train_loader) * epochs // gradient_accumulation_steps
-    warmup_steps = total_steps // 10  # 10% of total steps for warmup
-    scheduler = get_linear_schedule_with_warmup(optimizer.base_optimizer, warmup_steps, total_steps)
+    warmup_steps = total_steps // 10
+
+    scheduler = LinearWarmupCosineAnnealingLR(optimizer.base_optimizer, warmup_steps, total_steps)
 
     world_size = torch.cuda.device_count()
     if world_size > 1:
         mp.spawn(train_parallel, args=(world_size, model, train_loader, val_loader, optimizer, scheduler, epochs, gradient_accumulation_steps), nprocs=world_size, join=True)
     else:
         train(model, train_loader, val_loader, optimizer, scheduler, device, epochs, gradient_accumulation_steps)
-
 
     prompt = "Question: What is the meaning of life?\nAnswer:"
     generated_text = generate(model, tokenizer, prompt, device)
