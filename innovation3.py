@@ -565,6 +565,17 @@ class Trainer:
 
         self.step = 0
 
+        # Mixed precision forward (safe across devices)
+        if self.device == 'cuda':
+            autocast_ctx = torch.amp.autocast(device_type='cuda')
+        elif self.device == 'cpu':
+            autocast_ctx = torch.amp.autocast(device_type='cpu')
+        else:
+            # MPS or other devices: disable autocast by default for stability
+            autocast_ctx = contextlib.nullcontext()
+
+        self.autocast_ctx = autocast_ctx
+
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader, max_batches: int = None) -> tuple[float, float]:
         """Fast evaluation with mixed precision.
@@ -632,16 +643,7 @@ class Trainer:
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
 
-        # Mixed precision forward (safe across devices)
-        if self.device == 'cuda':
-            autocast_ctx = torch.amp.autocast(device_type='cuda')
-        elif self.device == 'cpu':
-            autocast_ctx = torch.amp.autocast(device_type='cpu')
-        else:
-            # MPS or other devices: disable autocast by default for stability
-            autocast_ctx = contextlib.nullcontext()
-
-        with autocast_ctx:
+        with self.autocast_ctx:
             logits = self.model(inputs)
 
             # Entropy-weighted loss
@@ -688,12 +690,7 @@ class Trainer:
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
 
-        if self.device == 'cuda':
-            autocast_ctx = torch.amp.autocast(device_type='cuda')
-        else:
-            autocast_ctx = contextlib.nullcontext()
-
-        with autocast_ctx:
+        with self.autocast_ctx:
             logits = self.model(inputs)
             loss = F.cross_entropy(
                 logits.reshape(-1, 259),
@@ -972,7 +969,7 @@ CORIOLANUS:
     print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
 
     # Train example (uncomment to run)
-    model = train("data/tiny_shakespeare.txt", batch_size=16, epochs=20)
+    model = train("data/tiny_shakespeare.txt", batch_size=32, epochs=5)
 
 
 
