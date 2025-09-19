@@ -19,10 +19,17 @@ from grokadamw import GrokAdamW
 
 # ============= ENCODER =============
 
-class DifferentialBitEncoder:
-    """Multi-perspective byte encoding."""
+class GrayCodeEncoder:
+    """Gray code preserves bit locality."""
 
     START, EOS, PAD = 256, 257, 258
+
+    def __init__(self):
+        # Precompute Gray code lookup
+        self.gray_lut = np.array([i ^ (i >> 1) for i in range(256)], dtype=np.int64)
+        self.gray_inv = np.zeros(256, dtype=np.int64)
+        for i in range(256):
+            self.gray_inv[self.gray_lut[i]] = i
 
     def encode(self, text: str) -> np.ndarray:
         if not text:
@@ -32,13 +39,15 @@ class DifferentialBitEncoder:
         output = np.zeros(len(text_bytes) + 2, dtype=np.int64)
 
         output[0] = self.START
-        output[1:len(text_bytes)+1] = text_bytes
+        output[1:-1] = self.gray_lut[text_bytes]
         output[-1] = self.EOS
         return output
 
     def decode(self, seq: np.ndarray) -> str:
-        mask = (seq >= 0) & (seq < 256)
-        return bytes(seq[mask].astype(np.uint8)).decode('utf-8', errors='ignore')
+        mask = (seq < 256)
+        gray_bytes = seq[mask]
+        original = self.gray_inv[gray_bytes]
+        return bytes(original.astype(np.uint8)).decode('utf-8', errors='ignore')
 
 class XOR8BitEncoder:
     """Stateless XOR encoder - no vocabulary needed."""
@@ -92,7 +101,7 @@ class XORDataset(Dataset):
 
     def __init__(self, data_path: Union[str, Path], seq_length: int = 512,
                  stride: Optional[int] = None):
-        self.encoder = DifferentialBitEncoder()
+        self.encoder = GrayCodeEncoder()
         self.seq_length = seq_length
         self.stride = stride or seq_length // 2
 
@@ -297,7 +306,7 @@ class XOR8BitLM(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
-        self.encoder = DifferentialBitEncoder()
+        self.encoder = GrayCodeEncoder()
         # Precompute 8-bit lookup table [256, 8] for fast bit extraction
         lut_vals = (torch.arange(256, dtype=torch.int64).unsqueeze(-1) >> torch.arange(8, dtype=torch.int64)) & 1
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
@@ -305,7 +314,7 @@ class XOR8BitLM(nn.Module):
         self._causal_masks: dict[tuple[int, int], torch.Tensor] = {}
 
         # Bit projection: 8 bits -> d_model
-        self.bit_proj = nn.Linear(24, d_model)
+        self.bit_proj = nn.Linear(8, d_model)
 
         # RoPE for positional encoding
         if d_model % n_heads != 0 or ((d_model // n_heads) % 2 != 0):
@@ -345,44 +354,26 @@ class XOR8BitLM(nn.Module):
 
     @torch.jit.export
     def to_bits(self, x: torch.Tensor) -> torch.Tensor:
-        """Multi-perspective bit features."""
-        B, L = x.shape
+        """Convert sequence to bit features (vectorized with LUT)."""
+        # Lookup bits for bytes 0..255
+        byte_bits = self.bit_lut[x.clamp(min=0, max=255)]  # [B, L, 8], float32
 
-        # Raw bits (8)
-        raw_bits = self.bit_lut[x.clamp(0, 255)]
+        # Zero out any non-byte tokens (>=256) without host sync
+        non_byte_mask = (x >= 256)
+        if non_byte_mask.dtype != torch.bool:
+            non_byte_mask = non_byte_mask.bool()
+        byte_bits = byte_bits.masked_fill(non_byte_mask.unsqueeze(-1), 0.0)
 
-        # Delta from previous (8 bits)
-        prev = torch.cat([x[:, :1], x[:, :-1]], dim=1)
-        delta = ((x - prev) % 256).clamp(0, 255)
-        delta_bits = self.bit_lut[delta]
-
-        # Hamming distance (4 bits - encode as one-hot up to 4)
-        xor_diff = (x ^ prev).clamp(0, 255)
-        hamming = self.bit_lut[xor_diff].sum(dim=-1).long().clamp(0, 3)
-        hamming_bits = torch.zeros(B, L, 4, device=x.device)
-        hamming_bits.scatter_(-1, hamming.unsqueeze(-1), 1.0)
-
-        # Local average delta (4 bits) - Fixed padding issue
-        x1 = x.float().unsqueeze(1)
-        x_padded = F.pad(x1, (1, 2), mode='replicate')  # Pad time axis after channel add
-        kernel = torch.ones(1, 1, 4, device=x.device) / 4
-        local_avg = F.conv1d(x_padded, kernel, padding=0).squeeze(1)
-        avg_delta = ((x - local_avg).abs() / 32).long().clamp(0, 3)
-        avg_bits = torch.zeros(B, L, 4, device=x.device)
-        avg_bits.scatter_(-1, avg_delta.unsqueeze(-1), 1.0)
-
-        # Concatenate all features [B, L, 24]
-        features = torch.cat([raw_bits, delta_bits, hamming_bits, avg_bits], dim=-1)
-
-        # Handle special tokens
-        special_mask = x >= 256
-        features = features.masked_fill(special_mask.unsqueeze(-1), 0.0)
+        # Overlay special tokens without conditional host syncs
+        # START (256): set bit 0 to 1
         start_mask = (x == self.encoder.START)
+        byte_bits[..., 0] = torch.where(start_mask, torch.ones_like(byte_bits[..., 0]), byte_bits[..., 0])
+        # EOS (257): set bit 1 to 1
         eos_mask = (x == self.encoder.EOS)
-        features[..., 0] = torch.where(start_mask, torch.ones_like(features[..., 0]), features[..., 0])
-        features[..., 1] = torch.where(eos_mask, torch.ones_like(features[..., 1]), features[..., 1])
+        byte_bits[..., 1] = torch.where(eos_mask, torch.ones_like(byte_bits[..., 1]), byte_bits[..., 1])
 
-        return features
+        # PAD (258) remains zeros due to non-byte zeroing above
+        return byte_bits
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Return cached upper-triangular causal mask of shape [L, L] (bool)."""
@@ -961,7 +952,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # Test encoder
-    enc = DifferentialBitEncoder()
+    enc = GrayCodeEncoder()
     text = "Hello World!"
     encoded = enc.encode(text)
     decoded = enc.decode(encoded)
