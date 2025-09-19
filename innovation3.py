@@ -3,6 +3,7 @@
 Fast, elegant, vocabulary-free language modeling
 """
 
+import itertools
 import math
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ from typing import Optional, Union, Dict, Any
 import json
 import contextlib
 from tqdm import tqdm
+from grokadamw import GrokAdamW
 
 # ============= ENCODER =============
 
@@ -443,15 +445,57 @@ class XOR8BitLM(nn.Module):
 
 # ============= TRAINING =============
 
+class StreamingGrokMetrics:
+    """Exponential moving average metrics for fast grokking signals."""
+
+    def __init__(self, alpha=0.99):
+        self.alpha = alpha  # EMA decay
+        self.train_loss_ema = None
+        self.eval_loss_ema = None
+        self.perp_ema = None
+        self.best_perp = float('inf')
+
+    def update_train(self, loss: float):
+        if self.train_loss_ema is None:
+            self.train_loss_ema = loss
+        else:
+            self.train_loss_ema = self.alpha * self.train_loss_ema + (1 - self.alpha) * loss
+
+    def update_eval(self, loss: float, perplexity: float):
+        if self.eval_loss_ema is None:
+            self.eval_loss_ema = loss
+            self.perp_ema = perplexity
+        else:
+            self.eval_loss_ema = self.alpha * self.eval_loss_ema + (1 - self.alpha) * loss
+            self.perp_ema = self.alpha * self.perp_ema + (1 - self.alpha) * perplexity
+
+        self.best_perp = min(self.best_perp, perplexity)
+
+    def get_signal(self) -> float:
+        if self.train_loss_ema is None or self.eval_loss_ema is None:
+            return 0.0
+
+        # Smooth signals with EMA
+        loss_gap = max(0, self.eval_loss_ema - self.train_loss_ema)
+        loss_signal = loss_gap / max(self.eval_loss_ema, self.train_loss_ema, 1e-6)
+
+        perp_signal = 0.0
+        if self.best_perp < float('inf'):
+            perp_signal = max(0, (self.perp_ema - self.best_perp) / self.best_perp)
+
+        return 0.7 * loss_signal + 0.3 * perp_signal
+
 class Trainer:
     """Efficient trainer with mixed precision and gradient accumulation."""
 
     def __init__(self, model: XOR8BitLM, lr=3e-4, warmup_steps=1000,
                  weight_decay=0.1, grad_accum_steps=1, device='cuda',
-                 total_steps: int | None = None):
+                 total_steps: int | None = None, ema_alpha=0.99):
         self.model = model.to(device)
         self.device = device
         self.grad_accum_steps = grad_accum_steps
+
+        self.metrics = StreamingGrokMetrics(alpha=ema_alpha)
 
         # Optimizer with weight decay on everything except biases and norms
         decay = set()
@@ -462,12 +506,33 @@ class Trainer:
             else:
                 decay.add(name)
 
+        param_groups = [
+            {'params': [p for n, p in model.named_parameters() if n in decay],
+             'weight_decay': weight_decay},
+            {'params': [p for n, p in model.named_parameters() if n in no_decay],
+             'weight_decay': 0.0}
+        ]
+
+        self.train_loss = None
+        self.eval_loss = None
+        self.perplexity = float('inf')
+        self.best_perplexity = float('inf')
+
+        self.opt = GrokAdamW(
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            grokking_signal_fns=[lambda: self.metrics.get_signal()]
+        )
+
+        """
         self.opt = torch.optim.AdamW([
             {'params': [p for n, p in model.named_parameters() if n in decay],
              'weight_decay': weight_decay},
             {'params': [p for n, p in model.named_parameters() if n in no_decay],
              'weight_decay': 0.0}
         ], lr=lr, betas=(0.9, 0.95), eps=1e-8)
+        """
 
         # OneCycle schedule with proper total steps and warmup fraction
         if total_steps is None:
@@ -482,6 +547,65 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
 
         self.step = 0
+
+    @torch.no_grad()
+    def evaluate(self, dataloader: DataLoader, max_batches: int = None) -> tuple[float, float]:
+        """Fast evaluation with mixed precision.
+        Returns: (avg_loss, perplexity)
+        """
+        self.model.eval()
+        losses = []
+        total_tokens = 0
+
+        # Limit evaluation batches for speed
+        eval_batches = enumerate(dataloader)
+        if max_batches:
+            eval_batches = itertools.islice(eval_batches, max_batches)
+
+        for i, batch in eval_batches:
+            batch = batch.to(self.device)
+            inputs = batch[:, :-1]
+            targets = batch[:, 1:]
+
+            # Use same autocast context as training
+            if self.device == 'cuda':
+                autocast_ctx = torch.amp.autocast(device_type='cuda')
+            else:
+                autocast_ctx = contextlib.nullcontext()
+
+            with autocast_ctx:
+                logits = self.model(inputs)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, 259),
+                    targets.reshape(-1),
+                    ignore_index=self.model.encoder.PAD,
+                    reduction='none'
+                )
+
+                # Track valid tokens for accurate perplexity
+                valid_mask = targets.reshape(-1) != self.model.encoder.PAD
+                valid_loss = loss[valid_mask]
+
+                if valid_loss.numel() > 0:
+                    losses.append(valid_loss.mean().item())
+                    total_tokens += valid_loss.numel()
+
+        self.model.train()
+
+        if not losses:
+            return float('inf'), float('inf')
+
+        avg_loss = np.mean(losses)
+        perplexity = math.exp(min(avg_loss, 20))  # Cap to prevent overflow
+
+        return avg_loss, perplexity
+
+    def update_metrics(self, train_loss: float, eval_loss: float, perplexity: float):
+        """Update tracked metrics for grokking signal."""
+        self.train_loss = train_loss
+        self.eval_loss = eval_loss
+        self.perplexity = perplexity
+        self.best_perplexity = min(self.best_perplexity, perplexity)
 
     def train_step(self, batch: torch.Tensor) -> float:
         """Single training step with mixed precision."""
@@ -519,6 +643,10 @@ class Trainer:
         else:
             loss.backward()
 
+        # Update streaming train loss immediately
+        actual_loss = loss.item() * self.grad_accum_steps
+        self.metrics.update_train(actual_loss)
+
         # Optimizer step
         if (self.step + 1) % self.grad_accum_steps == 0:
             if self.scaler:
@@ -534,7 +662,44 @@ class Trainer:
             self.scheduler.step()
 
         self.step += 1
-        return loss.item() * self.grad_accum_steps
+        return actual_loss
+
+    @torch.no_grad()
+    def eval_step(self, batch: torch.Tensor) -> tuple[float, int]:
+        """Single evaluation step - returns loss and valid token count."""
+        batch = batch.to(self.device)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+
+        if self.device == 'cuda':
+            autocast_ctx = torch.amp.autocast(device_type='cuda')
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        with autocast_ctx:
+            logits = self.model(inputs)
+            loss = F.cross_entropy(
+                logits.reshape(-1, 259),
+                targets.reshape(-1),
+                ignore_index=self.encoder.PAD,
+                reduction='none'
+            )
+
+            valid_mask = targets.reshape(-1) != self.encoder.PAD
+            valid_loss = loss[valid_mask]
+
+            if valid_loss.numel() > 0:
+                return valid_loss.mean().item(), valid_loss.numel()
+            return 0.0, 0
+
+    def quick_eval_update(self, val_batch: torch.Tensor):
+        """Fast single-batch evaluation for streaming metrics."""
+        self.model.eval()
+        loss, n_tokens = self.eval_step(val_batch)
+        if n_tokens > 0:
+            perplexity = math.exp(min(loss, 20))
+            self.metrics.update_eval(loss, perplexity)
+        self.model.train()
 
     @property
     def encoder(self):
@@ -582,6 +747,7 @@ def load_model(path: Union[str, Path], device='cuda') -> XOR8BitLM:
 
 def train(
     data_path: Union[str, Path],
+    val_path: Optional[Union[str, Path]] = None,  # Optional separate validation set
     model_path: Union[str, Path] = "xor_model",
     d_model: int = 512,
     n_heads: int = 8,
@@ -590,6 +756,8 @@ def train(
     batch_size: int = 32,
     epochs: int = 10,
     lr: float = 3e-4,
+    eval_interval: int = 10,  # Eval every N training steps
+    ema_alpha: float = 0.99,  # EMA decay rate
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu',
     compile_model: bool = False
 ):
@@ -598,9 +766,19 @@ def train(
     print(f"Training on {device}")
 
     # Create dataset and loader
-    dataset = XORDataset(data_path, seq_length)
-    loader = DataLoader(dataset, batch_size, shuffle=True,
-                       num_workers=1, persistent_workers=True)
+    train_dataset = XORDataset(data_path, seq_length)
+    train_loader = DataLoader(train_dataset, batch_size, shuffle=True,
+                             num_workers=2, persistent_workers=True)
+
+    # Use validation split or same data for eval (with different sampling)
+    if val_path:
+        val_dataset = XORDataset(val_path, seq_length)
+    else:
+        # Use 10% of training data with different stride for pseudo-validation
+        val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
+
+    val_loader = DataLoader(val_dataset, batch_size, shuffle=True,  # Shuffle for variety
+                           num_workers=1, persistent_workers=True, pin_memory=(device=='cuda'))
 
     # Create model
     model = XOR8BitLM(d_model, n_heads, n_layers, seq_length)
@@ -610,26 +788,70 @@ def train(
         model = torch.compile(model)
 
     # Create trainer with correct OneCycle total steps
-    steps_per_epoch = max(len(loader), 1)
+    steps_per_epoch = max(len(train_loader), 1)
     total_steps = steps_per_epoch * epochs
     trainer = Trainer(model, lr=lr, device=device, total_steps=total_steps,
-                      warmup_steps=min(1000, max(1, total_steps // 10)))
+                      warmup_steps=min(1000, total_steps // 10), ema_alpha=ema_alpha)
+
+    val_iter = itertools.cycle(val_loader)
+
+    # Training loop with evaluation
+    global_step = 0
 
     # Training loop
     for epoch in range(epochs):
         model.train()
-        losses = []
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for batch in pbar:
-            loss = trainer.train_step(batch)
-            losses.append(loss)
-            pbar.set_postfix({'loss': f"{np.mean(losses[-100:]):.4f}"})
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for batch_idx, train_batch in enumerate(pbar):
+            # Training step (automatically updates streaming train loss)
+            loss = trainer.train_step(train_batch)
+            global_step += 1
+
+            # Streaming evaluation update
+            if global_step % eval_interval == 0:
+                val_batch = next(val_iter)
+                trainer.quick_eval_update(val_batch)
+
+            # Update progress bar with streaming metrics
+            pbar.set_postfix({
+                'loss': f"{loss:.4f}",
+                'train_ema': f"{trainer.metrics.train_loss_ema:.4f}" if trainer.metrics.train_loss_ema else "N/A",
+                'eval_ema': f"{trainer.metrics.eval_loss_ema:.4f}" if trainer.metrics.eval_loss_ema else "N/A",
+                'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
+                'grok': f"{trainer.metrics.get_signal():.3f}"
+            })
+
+        # Full evaluation at epoch end (optional, for logging)
+        model.eval()
+        eval_losses = []
+        for i, batch in enumerate(itertools.islice(val_loader, 100)):  # Sample 100 batches
+            loss, n_tokens = trainer.eval_step(batch)
+            if n_tokens > 0:
+                eval_losses.append(loss)
+
+        if eval_losses:
+            avg_eval_loss = np.mean(eval_losses)
+            epoch_perplexity = math.exp(min(avg_eval_loss, 20))
+
+            print(f"\nEpoch {epoch+1} Summary:")
+            print(f"  Streaming - Train EMA: {trainer.metrics.train_loss_ema:.4f}, "
+                  f"Eval EMA: {trainer.metrics.eval_loss_ema:.4f}, "
+                  f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
+            print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
+            print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
 
         # Save checkpoint
         if (epoch + 1) % 5 == 0:
-            save_model(model, model_path)
-            print(f"Saved checkpoint at epoch {epoch+1}")
+            save_model(model, model_path, {
+                'd_model': model.d_model,
+                'n_heads': model.n_heads,
+                'n_layers': len(model.layers),
+                'max_len': model.rope.max_seq_len,
+                'rope_base': model.rope.base,
+                'best_perplexity': trainer.metrics.best_perp,
+                'epoch': epoch + 1
+            })
 
         # Generate sample
         model.eval()
