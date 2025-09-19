@@ -190,6 +190,84 @@ class FeedForward(nn.Module):
         x = nn.functional.silu(x_fc1) * x_fc2
         return self.fc3(x)
 
+
+class AsymGQATransformerBlock(nn.Module):
+    """Transformer with Asymmetric Grouped-Query Attention"""
+
+    def __init__(self, d_model, n_heads, d_ff, rope,
+                 groups=None, dtype=torch.float32):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.rope = rope
+
+        # Asymmetric grouping: list of lists [[0,1,2], [3], [4,5,6,7], ...]
+        # If None, use standard MHA
+        self.groups = groups or [[i] for i in range(n_heads)]
+        self.n_kv_heads = len(self.groups)
+
+        # Create mapping: which KV head does each Q head use?
+        self.register_buffer('kv_map', self._create_kv_map())
+
+        # Q always full size, K/V based on groups
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # FFN and norms unchanged
+        self.ffn = FeedForward(d_model, d_ff, dtype)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+
+    def _create_kv_map(self):
+        """Create index mapping from Q heads to KV heads"""
+        kv_map = torch.zeros(self.n_heads, dtype=torch.long)
+        for kv_idx, group in enumerate(self.groups):
+            for q_idx in group:
+                kv_map[q_idx] = kv_idx
+        return kv_map
+
+    def forward(self, x, mask=None, key_padding_mask=None):
+        B, L, D = x.shape
+
+        # Pre-norm
+        x_norm = self.norm1(x)
+
+        # Project Q (full), K/V (grouped)
+        q = self.q_proj(x_norm).reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x_norm).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x_norm).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Expand K,V to match Q heads using pre-computed mapping
+        k = k[:, self.kv_map]  # [B, n_heads, L, head_dim]
+        v = v[:, self.kv_map]
+
+        # Apply RoPE
+        q, k = self.rope(q, k, seq_len=L)
+
+        # Standard attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        if mask is not None:
+            scores.masked_fill_(mask[None, None, :, :], -float('inf'))
+        if key_padding_mask is not None:
+            scores.masked_fill_(key_padding_mask[:, None, None, :], -float('inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).reshape(B, L, D)
+        out = self.o_proj(out)
+
+        # Residual + FFN
+        x = x + out
+        x = x + self.ffn(self.norm2(x))
+
+        return x
+
+
 class TransformerBlock(nn.Module):
     """Transformer layer with integrated RoPE - Fixed."""
 
@@ -280,11 +358,25 @@ class XOR8BitLM(nn.Module):
         head_dim = d_model // n_heads
         self.rope = RotaryEmbedding(head_dim, max_len, rope_base)
 
+        groups_per_layer = [
+            [[0,1], [2,3], [4,5], [6,7]] if i < 2 else  # Early: 4 KV
+            [[0,1,2], [3,4,5], [6,7]] if i < 4 else     # Mid: 3 KV
+            [[0,1,2,3], [4,5,6,7]]                      # Late: 2 KV
+            for i in range(n_layers)
+        ]
+
         # Transformer
+        """
         self.layers = nn.ModuleList([
             TransformerBlock(d_model, n_heads, d_model * 4,
                                     self.rope)
             for _ in range(n_layers)
+        ])
+        """
+
+        self.layers = nn.ModuleList([
+            AsymGQATransformerBlock(d_model, n_heads, d_model * 4, self.rope, groups)
+            for groups in groups_per_layer
         ])
 
         self.norm = RMSNorm(d_model)
