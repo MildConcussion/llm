@@ -268,69 +268,6 @@ class AsymGQATransformerBlock(nn.Module):
         return x
 
 
-class TransformerBlock(nn.Module):
-    """Transformer layer with integrated RoPE - Fixed."""
-
-    def __init__(self, d_model, n_heads, d_ff, rope, dtype = torch.float32):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.rope = rope
-
-        # Multi-head attention components (bias=False for consistency and efficiency)
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # Feed-forward network
-        self.ffn = FeedForward(d_model, d_ff, dtype)
-
-        # Layer norms (pre-norm architecture)
-        self.norm1 = RMSNorm(d_model, eps=1e-6)
-        self.norm2 = RMSNorm(d_model, eps=1e-6)
-
-
-    def forward(self, x, mask=None, key_padding_mask=None):
-        B, L, D = x.shape
-        H = self.n_heads
-        head_dim = D // H
-
-        # Pre-norm and attention
-        x_norm = self.norm1(x)
-
-        # Project to Q, K, V and reshape to [B, H, L, head_dim]
-        q = self.q_proj(x_norm).reshape(B, L, H, head_dim).transpose(1, 2)
-        k = self.k_proj(x_norm).reshape(B, L, H, head_dim).transpose(1, 2)
-        v = self.v_proj(x_norm).reshape(B, L, H, head_dim).transpose(1, 2)
-
-        # Apply RoPE to queries and keys
-        q, k = self.rope(q, k, seq_len=L)
-
-        # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-
-        if mask is not None:
-            scores.masked_fill_(mask[None, None, :, :], -float('inf'))
-        if key_padding_mask is not None:
-            # Do not attend to PAD keys
-            scores.masked_fill_(key_padding_mask[:, None, None, :], -float('inf'))
-
-        attn = F.softmax(scores, dim=-1)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).reshape(B, L, D)
-        out = self.o_proj(out)
-
-        # Residual connection
-        x = x + out
-
-        # Feed-forward with residual
-        x = x + self.ffn(self.norm2(x))
-
-        return x
-
 class XOR8BitLM(nn.Module):
     """Fast XOR-based Language Model."""
 
@@ -364,15 +301,6 @@ class XOR8BitLM(nn.Module):
             [[0,1,2,3], [4,5,6,7]]                      # Late: 2 KV
             for i in range(n_layers)
         ]
-
-        # Transformer
-        """
-        self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_model * 4,
-                                    self.rope)
-            for _ in range(n_layers)
-        ])
-        """
 
         self.layers = nn.ModuleList([
             AsymGQATransformerBlock(d_model, n_heads, d_model * 4, self.rope, groups)
@@ -616,15 +544,6 @@ class Trainer:
             weight_decay=weight_decay,
             grokking_signal_fns=[lambda: self.metrics.get_signal()]
         )
-
-        """
-        self.opt = torch.optim.AdamW([
-            {'params': [p for n, p in model.named_parameters() if n in decay],
-             'weight_decay': weight_decay},
-            {'params': [p for n, p in model.named_parameters() if n in no_decay],
-             'weight_decay': 0.0}
-        ], lr=lr, betas=(0.9, 0.95), eps=1e-8)
-        """
 
         # OneCycle schedule with proper total steps and warmup fraction
         if total_steps is None:
