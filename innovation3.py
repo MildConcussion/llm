@@ -298,6 +298,7 @@ class XOR8BitLM(nn.Module):
         groups_per_layer = [
             [[0,1], [2,3], [4,5], [6,7]] if i < 2 else  # Early: 4 KV
             [[0,1,2], [3,4,5], [6,7]] if i < 4 else     # Mid: 3 KV
+            [[0,1], [2,3,4], [5,6,7]] if i < 6 else     # Mid: 3 KV
             [[0,1,2,3], [4,5,6,7]]                      # Late: 2 KV
             for i in range(n_layers)
         ]
@@ -327,22 +328,21 @@ class XOR8BitLM(nn.Module):
         # Lookup bits for bytes 0..255
         byte_bits = self.bit_lut[x.clamp(min=0, max=255)]  # [B, L, 8], float32
 
-        # Zero out any non-byte tokens (>=256)
+        # Zero out any non-byte tokens (>=256) without host sync
         non_byte_mask = (x >= 256)
-        if non_byte_mask.any():
-            byte_bits[non_byte_mask] = 0.0
+        if non_byte_mask.dtype != torch.bool:
+            non_byte_mask = non_byte_mask.bool()
+        byte_bits = byte_bits.masked_fill(non_byte_mask.unsqueeze(-1), 0.0)
 
-        # Overlay special tokens
-        # START (256) => set bit 0 to 1; EOS (257) => set bit 1 to 1; PAD (258) => all zeros
-        # Since non-byte positions were zeroed, we can directly set the corresponding bit planes
+        # Overlay special tokens without conditional host syncs
+        # START (256): set bit 0 to 1
         start_mask = (x == self.encoder.START)
+        byte_bits[..., 0] = torch.where(start_mask, torch.ones_like(byte_bits[..., 0]), byte_bits[..., 0])
+        # EOS (257): set bit 1 to 1
         eos_mask = (x == self.encoder.EOS)
+        byte_bits[..., 1] = torch.where(eos_mask, torch.ones_like(byte_bits[..., 1]), byte_bits[..., 1])
 
-        if start_mask.any():
-            byte_bits[..., 0] = torch.where(start_mask, torch.ones_like(byte_bits[..., 0]), byte_bits[..., 0])
-        if eos_mask.any():
-            byte_bits[..., 1] = torch.where(eos_mask, torch.ones_like(byte_bits[..., 1]), byte_bits[..., 1])
-
+        # PAD (258) remains zeros due to non-byte zeroing above
         return byte_bits
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -517,19 +517,25 @@ class Trainer:
 
         self.metrics = StreamingGrokMetrics(alpha=ema_alpha)
 
-        # Optimizer with weight decay on everything except biases and norms
-        decay = set()
-        no_decay = set()
+        # Optimizer with weight decay on everything except biases and norm gains
+        # Robustly exclude RMSNorm (scale/shift), LayerNorm weights, and any biases
+        decay_names = set()
+        no_decay_names = set()
         for name, param in model.named_parameters():
-            if 'bias' in name or 'norm' in name:
-                no_decay.add(name)
+            if not param.requires_grad:
+              continue  # frozen weights
+            if len(param.shape) == 1 or "bit_proj" in name or name.endswith('.bias') or '.norm' in name or name.endswith('.scale') or name.endswith('.shift'):
+                no_decay_names.add(name)
             else:
-                decay.add(name)
+                decay_names.add(name)
+
+        # print(f"\ndecay_names: {decay_names}\n")
+        # print(f"no_decay_names: {no_decay_names}\n")
 
         param_groups = [
-            {'params': [p for n, p in model.named_parameters() if n in decay],
+            {'params': [p for n, p in model.named_parameters() if n in decay_names],
              'weight_decay': weight_decay},
-            {'params': [p for n, p in model.named_parameters() if n in no_decay],
+            {'params': [p for n, p in model.named_parameters() if n in no_decay_names],
              'weight_decay': 0.0}
         ]
 
@@ -662,11 +668,11 @@ class Trainer:
         if (self.step + 1) % self.grad_accum_steps == 0:
             if self.scaler:
                 self.scaler.unscale_(self.opt)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.opt)
                 self.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.opt.step()
 
             self.opt.zero_grad(set_to_none=True)
@@ -724,13 +730,23 @@ def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] 
     path.mkdir(exist_ok=True, parents=True)
 
     # Save config
-    config = config or {
+    allowed_keys = {'d_model', 'n_heads', 'n_layers', 'max_len', 'rope_base'}
+    default_config = {
         'd_model': model.d_model,
         'n_heads': model.n_heads,
         'n_layers': len(model.layers),
         'max_len': model.rope.max_seq_len,
         'rope_base': model.rope.base
     }
+    # Filter incoming config to contain only model constructor keys; fill missing from defaults
+    if config is not None:
+        filtered = {k: v for k, v in config.items() if k in allowed_keys}
+        for k in allowed_keys:
+            if k not in filtered:
+                filtered[k] = default_config[k]
+        config = filtered
+    else:
+        config = default_config
 
     with open(path / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
@@ -744,7 +760,10 @@ def load_model(path: Union[str, Path], device='cuda') -> XOR8BitLM:
 
     # Load config
     with open(path / 'config.json', 'r') as f:
-        config = json.load(f)
+        loaded = json.load(f)
+        # Be robust to extra metadata keys in older checkpoints
+        allowed_keys = {'d_model', 'n_heads', 'n_layers', 'max_len', 'rope_base'}
+        config = {k: v for k, v in loaded.items() if k in allowed_keys}
 
     # Create model
     model = XOR8BitLM(**config)
@@ -938,7 +957,7 @@ CORIOLANUS:
     # Test model
     model = XOR8BitLM(d_model=512,
     n_heads=8,
-    n_layers=6,
+    n_layers=8,
     rope_base=10000)
     device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
     model = model.to(device)
