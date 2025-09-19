@@ -702,27 +702,29 @@ CORIOLANUS:
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
     # Test model
-
+    model = XOR8BitLM(d_model=512,
+    n_heads=8,
+    n_layers=6,
+    rope_base=10000)
     device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-    model = load_model("xor_model", device)
     model = model.to(device)
 
-    #print("\nModel architecture:")
-    #print(model)
+    print("\nModel architecture:")
+    print(model)
 
     # Test generation (untrained)
-    output = model.generate("The world is a cold place", max_len=200)
+    output = model.generate("Test", max_len=20)
     print(f"\nGenerated (untrained): {output}")
 
-    #print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
 
     # Train example (uncomment to run)
-    #model = train("data/tiny_shakespeare.txt", batch_size=16, epochs=20)
+    model = train("data/tiny_shakespeare.txt", batch_size=16, epochs=20)
 
 
 
-    #output = model.generate(input_text, max_len=200)
-    #print(f"\nGenerated:\n{output}")
+    output = model.generate(input_text, max_len=200)
+    print(f"\nGenerated:\n{output}")
 
     # Or train from HuggingFace
     # model = train_from_hf("wikitext", "wikitext-2-raw-v1", epochs=5)
