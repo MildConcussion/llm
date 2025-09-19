@@ -197,11 +197,11 @@ class TransformerBlock(nn.Module):
         self.n_heads = n_heads
         self.rope = rope
 
-        # Multi-head attention components
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.o_proj = nn.Linear(d_model, d_model)
+        # Multi-head attention components (bias=False for consistency and efficiency)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
         # Feed-forward network
         self.ffn = FeedForward(d_model, d_ff, dtype)
@@ -260,6 +260,11 @@ class XOR8BitLM(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.encoder = XOR8BitEncoder()
+        # Precompute 8-bit lookup table [256, 8] for fast bit extraction
+        lut_vals = (torch.arange(256, dtype=torch.int64).unsqueeze(-1) >> torch.arange(8, dtype=torch.int64)) & 1
+        self.register_buffer('bit_lut', lut_vals.to(torch.float32))
+        # Cache for causal masks by (device, seq_len)
+        self._causal_masks: dict[tuple[int, int], torch.Tensor] = {}
 
         # Bit projection: 8 bits -> d_model
         self.bit_proj = nn.Linear(8, d_model)
@@ -296,42 +301,36 @@ class XOR8BitLM(nn.Module):
 
     @torch.jit.export
     def to_bits(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert sequence to bit features - FIXED VERSION."""
-        B, L = x.shape
-        device = x.device
+        """Convert sequence to bit features (vectorized with LUT)."""
+        # Lookup bits for bytes 0..255
+        byte_bits = self.bit_lut[x.clamp(min=0, max=255)]  # [B, L, 8], float32
 
-        # Create bit representation
-        bits = torch.zeros(B, L, 8, device=device, dtype=torch.float32)
+        # Zero out any non-byte tokens (>=256)
+        non_byte_mask = (x >= 256)
+        if non_byte_mask.any():
+            byte_bits[non_byte_mask] = 0.0
 
-        # Handle normal bytes (0-255)
-        normal_mask = x < 256
+        # Overlay special tokens
+        # START (256) => set bit 0 to 1; EOS (257) => set bit 1 to 1; PAD (258) => all zeros
+        # Since non-byte positions were zeroed, we can directly set the corresponding bit planes
+        start_mask = (x == self.encoder.START)
+        eos_mask = (x == self.encoder.EOS)
 
-        # Efficient bit extraction using broadcasting
-        if normal_mask.any():
-            # Get positions where we have normal bytes
-            normal_vals = x.masked_fill(~normal_mask, 0)  # Zero out special tokens
+        if start_mask.any():
+            byte_bits[..., 0] = torch.where(start_mask, torch.ones_like(byte_bits[..., 0]), byte_bits[..., 0])
+        if eos_mask.any():
+            byte_bits[..., 1] = torch.where(eos_mask, torch.ones_like(byte_bits[..., 1]), byte_bits[..., 1])
 
-            # Extract bits using bitwise operations
-            for i in range(8):
-                bit_vals = ((normal_vals >> i) & 1).float()
-                bits[:, :, i] = bit_vals * normal_mask.float()
+        return byte_bits
 
-        # Handle special tokens
-        # START token (256): set bit 0
-        start_mask = (x == 256).unsqueeze(-1)
-        bits[:, :, 0] = torch.where(start_mask[:, :, 0],
-                                    torch.ones_like(bits[:, :, 0]),
-                                    bits[:, :, 0])
-
-        # EOS token (257): set bit 1
-        eos_mask = (x == 257).unsqueeze(-1)
-        bits[:, :, 1] = torch.where(eos_mask[:, :, 0],
-                                   torch.ones_like(bits[:, :, 1]),
-                                   bits[:, :, 1])
-
-        # PAD token (258): stays all zeros
-
-        return bits
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Return cached upper-triangular causal mask of shape [L, L] (bool)."""
+        key = (id(device), seq_len)
+        mask = self._causal_masks.get(key)
+        if mask is None or mask.device != device:
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), 1)
+            self._causal_masks[key] = mask
+        return mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with RoPE."""
@@ -342,7 +341,7 @@ class XOR8BitLM(nn.Module):
         h = self.bit_proj(bits)
 
         # Create causal mask
-        mask = torch.triu(torch.ones(L, L, device=x.device), 1).bool()
+        mask = self._get_causal_mask(L, x.device)
         # Key padding mask: True where token is PAD
         key_padding_mask = (x == self.encoder.PAD)
 
@@ -402,10 +401,12 @@ class XOR8BitLM(nn.Module):
 
             sorted_probs = F.softmax(sorted_logits, dim=-1)
 
-            # Top-p filtering
+            # Top-p filtering (ensure at least 1 token kept)
             cumsum = torch.cumsum(sorted_probs, dim=-1)
-            sorted_idx_mask = cumsum - sorted_probs > top_p
-            sorted_logits[sorted_idx_mask] = -float('inf')
+            keep_mask = cumsum <= top_p
+            # Always keep the highest-prob token
+            keep_mask[..., 0] = True
+            sorted_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -float('inf')))
 
             # Final probability distribution
             probs = F.softmax(sorted_logits, dim=-1)
@@ -725,6 +726,9 @@ CORIOLANUS:
 
     output = model.generate(input_text, max_len=200)
     print(f"\nGenerated:\n{output}")
+
+    output = model.generate("The world is a cold place.", max_len=200)
+    print(f"\nGenerated (trained, unrepresented text): {output}")
 
     # Or train from HuggingFace
     # model = train_from_hf("wikitext", "wikitext-2-raw-v1", epochs=5)
