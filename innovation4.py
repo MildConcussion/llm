@@ -49,50 +49,6 @@ class GrayCodeEncoder:
         original = self.gray_inv[gray_bytes]
         return bytes(original.astype(np.uint8)).decode('utf-8', errors='ignore')
 
-class XOR8BitEncoder:
-    """Stateless XOR encoder - no vocabulary needed."""
-
-    START, EOS, PAD = 256, 257, 258
-
-    def encode(self, text: str) -> np.ndarray:
-        """Encode text to XOR sequence."""
-        if not text:
-            return np.array([self.START, self.EOS], dtype=np.int64)
-
-        text_bytes = text.encode('utf-8', errors='ignore')
-        output = np.zeros(len(text_bytes) + 2, dtype=np.int64)
-
-        output[0] = self.START
-        output[1] = text_bytes[0]
-
-        # XOR consecutive bytes
-        for i in range(1, len(text_bytes)):
-            output[i + 1] = text_bytes[i - 1] ^ text_bytes[i]
-
-        output[-1] = self.EOS
-        return output
-
-    def decode(self, seq: np.ndarray) -> str:
-        """Decode XOR sequence back to text."""
-        if len(seq) < 2 or seq[0] != self.START:
-            return ""
-
-        result = []
-        i = 1
-
-        # First byte
-        if i < len(seq) and seq[i] not in (self.EOS, self.PAD):
-            if seq[i] < 256:
-                result.append(int(seq[i]))
-                i += 1
-
-        # Reconstruct via XOR
-        while i < len(seq) and seq[i] not in (self.EOS, self.PAD):
-            if seq[i] < 256 and result:
-                result.append(result[-1] ^ int(seq[i]))
-            i += 1
-
-        return bytes(result).decode('utf-8', errors='ignore')
 
 # ============= DATASET =============
 
