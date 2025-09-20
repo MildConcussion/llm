@@ -4,7 +4,6 @@ Fast, elegant, vocabulary-free language modeling
 """
 
 import itertools
-import os
 import math
 import numpy as np
 import torch
@@ -12,11 +11,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any, List
 import json
 import contextlib
 from tqdm import tqdm
 from grokadamw import GrokAdamW
+from xor_packed import PackedXORShardDataset, MixedPackedXORDataset, discover_shards
+import os
+
+torch.set_float32_matmul_precision('high')
 
 
 def partition_heads_golden(n_heads, n_groups):
@@ -958,26 +961,97 @@ def train(
     eval_interval: int = 10,  # Eval every N training steps
     ema_alpha: float = 0.99,  # EMA decay rate
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu',
-    compile_model: bool = False
+    compile_model: bool = False,
+    packed_dirs: Optional[List[Union[str, Path]]] = None,  # Multiple packed dataset roots
+    val_packed_dirs: Optional[List[Union[str, Path]]] = None,
+    mixing_policy: str = 'round_robin',  # 'round_robin' or 'weighted'
+    mixing_weights: Optional[List[float]] = None,
 ):
     """Complete training pipeline."""
 
     print(f"Training on {device}")
 
-    # Create dataset and loader
-    train_dataset = XORDataset(data_path, seq_length)
-    train_loader = DataLoader(train_dataset, batch_size, shuffle=True,
-                             num_workers=2, persistent_workers=True)
+    # Helper to build device-tuned DataLoader args
+    def _loader_kwargs(for_eval: bool = False):
+        if device == 'cuda':
+            workers = min(8, (os.cpu_count() or 8))
+            return dict(num_workers=workers, pin_memory=True, persistent_workers=True, prefetch_factor=4, shuffle=not for_eval)
+        elif device == 'mps':
+            return dict(num_workers=2, pin_memory=False, persistent_workers=True, prefetch_factor=2, shuffle=not for_eval)
+        else:
+            workers = min(4, (os.cpu_count() or 4))
+            return dict(num_workers=workers, pin_memory=False, persistent_workers=True, prefetch_factor=2, shuffle=not for_eval)
 
-    # Use validation split or same data for eval (with different sampling)
-    if val_path:
-        val_dataset = XORDataset(val_path, seq_length)
+    # Create datasets and loaders (packed preferred)
+    def _build_packed_dataset(roots: List[Union[str, Path]]):
+        # For each root, discover shards and concatenate them into one dataset
+        ds_per_root = []
+        for r in roots:
+            shard_dirs = discover_shards(str(r))
+            if not shard_dirs:
+                continue
+            shard_datasets = [
+                PackedXORShardDataset(sd, seq_length=seq_length, stride=seq_length//2, pad_id=GrayCodeEncoder.PAD)
+                for sd in shard_dirs
+            ]
+            if len(shard_datasets) == 1:
+                ds_per_root.append(shard_datasets[0])
+            else:
+                ds_per_root.append(torch.utils.data.ConcatDataset(shard_datasets))
+
+        if not ds_per_root:
+            raise ValueError("No shards found in provided packed_dirs")
+
+        if len(ds_per_root) == 1:
+            return ds_per_root[0]
+
+        return MixedPackedXORDataset(ds_per_root, policy=mixing_policy, weights=mixing_weights)
+
+    use_packed = False
+    train_dataset = None
+    val_dataset = None
+
+    if packed_dirs is not None and len(packed_dirs) > 0:
+        train_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
+        use_packed = True
+        print(f"Using packed datasets for training. policy={mixing_policy}, weights={mixing_weights}")
     else:
-        # Use 10% of training data with different stride for pseudo-validation
-        val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
+        # Auto-detect packed shards under data_path directory
+        dp = Path(data_path)
+        if dp.is_dir():
+            shard_dirs = discover_shards(str(dp))
+            if shard_dirs:
+                train_dataset = _build_packed_dataset([dp])
+                use_packed = True
+                print(f"Auto-detected packed shards under {dp}")
 
-    val_loader = DataLoader(val_dataset, batch_size, shuffle=True,  # Shuffle for variety
-                           num_workers=1, persistent_workers=True, pin_memory=(device=='cuda'))
+    if train_dataset is None:
+        # Fallback to simple text dataset
+        train_dataset = XORDataset(data_path, seq_length)
+
+    train_loader = DataLoader(train_dataset, batch_size, **_loader_kwargs(for_eval=False))
+
+    # Validation dataset
+    if val_packed_dirs is not None and len(val_packed_dirs) > 0:
+        val_dataset = _build_packed_dataset([str(p) for p in val_packed_dirs])
+    elif val_path is not None:
+        vp = Path(val_path)
+        if vp.is_dir() and discover_shards(str(vp)):
+            val_dataset = _build_packed_dataset([vp])
+        else:
+            val_dataset = XORDataset(val_path, seq_length)
+    else:
+        if use_packed:
+            # Heuristic: reuse train roots for eval with full-stride windows (no shuffle in loader)
+            if packed_dirs is not None and len(packed_dirs) > 0:
+                val_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
+            else:
+                val_dataset = _build_packed_dataset([dp])
+        else:
+            # Use 10% of training data with different stride for pseudo-validation
+            val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
+
+    val_loader = DataLoader(val_dataset, batch_size, **_loader_kwargs(for_eval=True))
 
     # Create model
     model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base)
