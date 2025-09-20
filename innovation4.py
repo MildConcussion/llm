@@ -347,48 +347,6 @@ class FeedForward(nn.Module):
         return self.fc3(x)
 
 
-class SelectiveAttentionModule(nn.Module):
-    """Lightweight SSA temperature module with weight sharing."""
-
-    def __init__(self, d_model, max_len=2048):
-        super().__init__()
-        # Single learnable parameter for position-aware scaling
-        self.pos_alpha = nn.Parameter(torch.zeros(1))
-        # Output projection for token-aware temperature (weight sharing with attention)
-        self.temp_out = nn.Linear(d_model, 1, bias=False)
-        nn.init.normal_(self.temp_out.weight, std=0.02)
-
-        # Precompute position scales
-        positions = torch.arange(1, max_len + 1, dtype=torch.float32)
-        self.register_buffer('log_positions', torch.log(positions))
-
-    def forward(self, x, proj_weight):
-        """
-        x: [B, L, D]
-        proj_weight: attention projection weights for weight sharing
-        Returns: [B, L, 1] temperature values
-        """
-        B, L, D = x.shape
-
-        # Token-aware temperature using shared attention weights
-        # Use the transpose of projection weights as feature extractor
-        # proj_weight shape: [out_dim, in_dim], we need [in_dim, hidden] for feature extraction
-        # So we use first d_model columns of the transposed weight
-        weight_t = proj_weight.t()[:D, :min(D, proj_weight.shape[0])]  # [d_model, hidden_dim]
-        features = F.linear(x, weight_t.t())  # [B, L, hidden_dim]
-
-        # Apply GeLU and project to scalar temperature
-        features_gelu = F.gelu(features)
-        # Average pool over hidden dimension then project to scalar
-        features_pooled = features_gelu.mean(dim=-1, keepdim=True)  # [B, L, 1]
-        token_temp = torch.tanh(features_pooled)  # [B, L, 1]
-
-        # Position-aware temperature
-        pos_scale = 1 + torch.sigmoid(self.pos_alpha) * self.log_positions[:L].unsqueeze(0).unsqueeze(-1)
-
-        return token_temp * pos_scale
-
-
 class AsymGQATransformerBlock(nn.Module):
     """Transformer with Asymmetric Grouped-Query Attention"""
 
@@ -399,6 +357,7 @@ class AsymGQATransformerBlock(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.rope = rope
+        self.param_dtype = dtype
 
         # Asymmetric grouping: list of lists [[0,1,2], [3], [4,5,6,7], ...]
         # If None, use standard MHA
@@ -409,18 +368,26 @@ class AsymGQATransformerBlock(nn.Module):
         self.register_buffer('kv_map', self._create_kv_map())
 
         # Q always full size, K/V based on groups
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False, dtype=dtype)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
 
         # FFN and norms unchanged
         self.ffn = FeedForward(d_model, d_ff, dtype)
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
 
-        self.q_temp_module = SelectiveAttentionModule(d_model)
-        self.v_temp_module = SelectiveAttentionModule(d_model)
+        # Per-head additive tau parameters (token + position) inspired by screenshot design
+        # Token maps: project head-local features to a scalar per token and head
+        self.tau_wq = nn.Parameter(torch.zeros(self.n_heads, self.head_dim))
+        self.tau_wv_kv = nn.Parameter(torch.zeros(self.n_kv_heads, self.head_dim))
+        # Positional alpha per head
+        self.tau_alpha = nn.Parameter(torch.zeros(self.n_heads))
+
+        nn.init.normal_(self.tau_wq, std=0.02)
+        nn.init.normal_(self.tau_wv_kv, std=0.02)
+        nn.init.zeros_(self.tau_alpha)
 
     def _create_kv_map(self):
         """Create index mapping from Q heads to KV heads"""
@@ -436,28 +403,44 @@ class AsymGQATransformerBlock(nn.Module):
         # Pre-norm
         x_norm = self.norm1(x)
 
-        # Project Q (full), K/V (grouped)
-        q = self.q_proj(x_norm).reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x_norm).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x_norm).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # Project once
+        q_proj = self.q_proj(x_norm)  # [B, L, D]
+        k_proj = self.k_proj(x_norm)  # [B, L, n_kv_heads * head_dim]
+        v_proj = self.v_proj(x_norm)  # [B, L, n_kv_heads * head_dim]
 
-        # Get temperatures using weight sharing
-        q_temps = self.q_temp_module(x_norm, self.q_proj.weight)  # [B, L, 1]
-        v_temps = self.v_temp_module(x_norm, self.v_proj.weight)  # [B, L, 1]
+        # Reshape for attention
+        q = q_proj.reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_proj.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_proj.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Reshape for broadcasting across sequence dim (no transpose)
-        q_temps = q_temps.to(dtype=q.dtype, device=q.device).unsqueeze(1)  # [B, 1, L, 1]
-        v_temps = v_temps.to(dtype=v.dtype, device=v.device).unsqueeze(1)  # [B, 1, L, 1]
-
-        # Scale queries (controls attention spikiness)
-        q = q * q_temps
-
-        # Scale values (suppresses noise)
-        v = v * v_temps.expand(-1, self.n_kv_heads, -1, -1)
-
-        # Expand K,V to match Q heads using pre-computed mapping
-        k = k[:, self.kv_map]  # [B, n_heads, L, head_dim]
+        # Expand K,V
+        k = k[:, self.kv_map]
         v = v[:, self.kv_map]
+
+        # Tau computation using already-projected values
+        tok_feat_q = F.gelu(q_proj).reshape(B, L, self.n_heads, self.head_dim)
+        tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))
+
+        tok_feat_v = F.gelu(v_proj).reshape(B, L, self.n_kv_heads, self.head_dim)
+        tau_tok_v_grouped = torch.tanh((tok_feat_v * self.tau_wv_kv).sum(dim=-1))
+        tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,L,-1))
+
+        # Position term (standardized dtype)
+        if positions is None:
+            positions = torch.arange(L, device=x.device, dtype=torch.float32).view(1, L).expand(B, L)
+        else:
+            positions = positions.to(torch.float32)
+        pos_log = torch.log1p(positions)
+        alpha = torch.sigmoid(self.tau_alpha)
+        tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, L) - 0.5
+
+        # Final taus
+        tau_q = (tau_tok_q.transpose(1, 2) + tau_pos).unsqueeze(-1)
+        tau_v = (tau_tok_v.transpose(1, 2) + tau_pos).unsqueeze(-1)
+
+        # Apply gating
+        q = q * tau_q
+        v = v * tau_v
 
         # Apply RoPE (optionally with custom positions)
         q, k = self.rope(q, k, seq_len=L, positions=positions)
@@ -466,11 +449,17 @@ class AsymGQATransformerBlock(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         if mask is not None:
-            # Support [L, L] or [B, L, L]
-            if mask.dim() == 2:
-                scores.masked_fill_(mask[None, None, :, :], -float('inf'))
+            # Normalize mask to [B, 1, L, L]
+            if mask.dim() == 2:  # [L, L]
+                mask_norm = mask[None, None, :, :]
+            elif mask.dim() == 3:  # [B, L, L]
+                mask_norm = mask[:, None, :, :]
+            elif mask.dim() == 4:  # [B, 1, L, L] or [B, H, L, L]
+                # If heads dimension present, reduce/assume broadcastable
+                mask_norm = mask if mask.size(1) == 1 else mask[:, :1, :, :]
             else:
-                scores.masked_fill_(mask[:, None, :, :], -float('inf'))
+                raise ValueError(f"Unsupported mask shape: {mask.shape}")
+            scores.masked_fill_(mask_norm, -float('inf'))
         if key_padding_mask is not None:
             scores.masked_fill_(key_padding_mask[:, None, None, :], -float('inf'))
 
@@ -486,17 +475,151 @@ class AsymGQATransformerBlock(nn.Module):
 
         return x
 
+    def full_pass_return_kv(self, x, mask=None, key_padding_mask=None, positions: torch.Tensor | None = None):
+        """Full-sequence forward returning present K/V for caching.
+        x: [B, L, D]
+        Returns: x_out [B, L, D], k_present [B, H, L, head_dim], v_present [B, H, L, head_dim]
+        """
+        B, L, D = x.shape
+
+        x_norm = self.norm1(x)
+
+        q_proj = self.q_proj(x_norm)
+        k_proj = self.k_proj(x_norm)
+        v_proj = self.v_proj(x_norm)
+
+        q = q_proj.reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_proj.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_proj.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        k = k[:, self.kv_map]
+        v = v[:, self.kv_map]
+
+        tok_feat_q = F.gelu(q_proj).reshape(B, L, self.n_heads, self.head_dim)
+        tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))
+
+        tok_feat_v = F.gelu(v_proj).reshape(B, L, self.n_kv_heads, self.head_dim)
+        tau_tok_v_grouped = torch.tanh((tok_feat_v * self.tau_wv_kv).sum(dim=-1))
+        tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,L,-1))
+
+        if positions is None:
+            positions = torch.arange(L, device=x.device, dtype=torch.float32).view(1, L).expand(B, L)
+        else:
+            positions = positions.to(torch.float32)
+        pos_log = torch.log1p(positions)
+        alpha = torch.sigmoid(self.tau_alpha)
+        tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, L) - 0.5
+
+        tau_q = (tau_tok_q.transpose(1, 2) + tau_pos).unsqueeze(-1)
+        tau_v = (tau_tok_v.transpose(1, 2) + tau_pos).unsqueeze(-1)
+
+        q = q * tau_q
+        v = v * tau_v
+
+        q, k = self.rope(q, k, seq_len=L, positions=positions)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        if mask is not None:
+            if mask.dim() == 2:
+                mask_norm = mask[None, None, :, :]
+            elif mask.dim() == 3:
+                mask_norm = mask[:, None, :, :]
+            elif mask.dim() == 4:
+                mask_norm = mask if mask.size(1) == 1 else mask[:, :1, :, :]
+            else:
+                raise ValueError(f"Unsupported mask shape: {mask.shape}")
+            scores.masked_fill_(mask_norm, -float('inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).reshape(B, L, D)
+        out = self.o_proj(out)
+
+        x_out = x + out
+        x_out = x_out + self.ffn(self.norm2(x_out))
+
+        # Present K/V are post-RoPE and post-mapping, per head
+        k_present = k
+        v_present = v
+
+        return x_out, k_present, v_present
+
+    def forward_incremental(self, x_last, positions_last: torch.Tensor, past_k: torch.Tensor | None, past_v: torch.Tensor | None):
+        """Incremental step for the last token.
+        x_last: [B, 1, D]; positions_last: [B, 1] float32
+        past_k/v: [B, H, S, head_dim] or None
+        Returns: x_last_out [B, 1, D], k_all [B, H, S+1, head_dim], v_all [B, H, S+1, head_dim]
+        """
+        B, T, D = x_last.shape
+        assert T == 1, "forward_incremental expects a single-token sequence"
+
+        x_norm = self.norm1(x_last)
+
+        q_proj = self.q_proj(x_norm)
+        k_proj = self.k_proj(x_norm)
+        v_proj = self.v_proj(x_norm)
+
+        q = q_proj.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_proj.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_proj.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        k = k[:, self.kv_map]
+        v = v[:, self.kv_map]
+
+        tok_feat_q = F.gelu(q_proj).reshape(B, T, self.n_heads, self.head_dim)
+        tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))
+
+        tok_feat_v = F.gelu(v_proj).reshape(B, T, self.n_kv_heads, self.head_dim)
+        tau_tok_v_grouped = torch.tanh((tok_feat_v * self.tau_wv_kv).sum(dim=-1))
+        tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,T,-1))
+
+        positions_last = positions_last.to(torch.float32)
+        pos_log = torch.log1p(positions_last)
+        alpha = torch.sigmoid(self.tau_alpha)
+        tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, T) - 0.5
+
+        tau_q = (tau_tok_q.transpose(1, 2) + tau_pos).unsqueeze(-1)
+        tau_v = (tau_tok_v.transpose(1, 2) + tau_pos).unsqueeze(-1)
+
+        q = q * tau_q
+        v = v * tau_v
+
+        q, k = self.rope(q, k, seq_len=T, positions=positions_last)
+
+        # Concatenate to cache
+        if past_k is not None:
+            k_all = torch.cat([past_k, k], dim=2)
+            v_all = torch.cat([past_v, v], dim=2)
+        else:
+            k_all, v_all = k, v
+
+        scores = torch.matmul(q, k_all.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v_all)
+
+        out = out.transpose(1, 2).reshape(B, T, D)
+        out = self.o_proj(out)
+
+        x_out = x_last + out
+        x_out = x_out + self.ffn(self.norm2(x_out))
+
+        return x_out, k_all, v_all
+
 
 class XOR8BitLM(nn.Module):
     """Fast XOR-based Language Model with optional MuToR."""
 
     def __init__(self, d_model=512, n_heads=8, n_layers=6,
                  max_len=2048, rope_base=10000,
-                 mutor_dmax: int = 0, mutor_alpha: float = 0.3):
+                 mutor_dmax: int = 0, mutor_alpha: float = 0.3,
+                 dtype: torch.dtype = torch.float32):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.encoder = GrayCodeEncoder()
+        self.param_dtype = dtype
         # MuToR configuration
         self.mutor_dmax = int(mutor_dmax)
         self.mutor_alpha = float(mutor_alpha)
@@ -513,11 +636,9 @@ class XOR8BitLM(nn.Module):
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
         # Cache for causal masks by (device, seq_len)
         self._causal_masks: dict[tuple[str, int], torch.Tensor] = {}
-        # Cache for base MuToR causal masks (per seq_len) to reuse across batch
-        self._mutor_base_masks: dict[tuple[str, int], torch.Tensor] = {}
 
         # Bit projection: 8 bits -> d_model
-        self.bit_proj = nn.Linear(8, d_model)
+        self.bit_proj = nn.Linear(8, d_model, dtype=dtype)
 
         # Single learnable register embedding (additive bias)
         self.register_bias = nn.Parameter(torch.zeros(d_model))
@@ -536,14 +657,14 @@ class XOR8BitLM(nn.Module):
             print(f"Layer {i}: {g} (KV groups: {len(g)})")
 
         self.layers = nn.ModuleList([
-            AsymGQATransformerBlock(d_model, n_heads, d_model * 4, self.rope, groups)
+            AsymGQATransformerBlock(d_model, n_heads, d_model * 4, self.rope, groups, dtype=dtype)
             for groups in groups_per_layer
         ])
 
         self.norm = RMSNorm(d_model)
 
         # Output head (now 260 including REGISTER)
-        self.out = nn.Linear(d_model, len(self.encoder))
+        self.out = nn.Linear(d_model, len(self.encoder), dtype=dtype)
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -562,12 +683,32 @@ class XOR8BitLM(nn.Module):
         return self.bit_lut[x_clamped]
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Return cached upper-triangular causal mask of shape [L, L] (bool)."""
-        key = (str(device), seq_len)
-        mask = self._causal_masks.get(key)
-        if mask is None or mask.device != device:
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), 1)
-            self._causal_masks[key] = mask
+        """Return cached upper-triangular causal mask of shape [L, L] (bool) using small LRU."""
+        # LRU implemented with OrderedDict semantics
+        if not hasattr(self, '_causal_masks_lru'):
+            from collections import OrderedDict
+            self._causal_masks_lru = OrderedDict()
+            self._causal_masks_max = 64
+
+        key = (str(device), int(seq_len))
+        cache = self._causal_masks_lru
+
+        if key in cache:
+            mask = cache.pop(key)
+            # Refresh position to mark as most-recently-used
+            cache[key] = mask
+            # Move to device if needed (rare path)
+            if mask.device != device:
+                mask = mask.to(device)
+                cache[key] = mask
+            return mask
+
+        # Miss → create
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), 1)
+        cache[key] = mask
+        # Evict least-recently-used if beyond capacity
+        if len(cache) > self._causal_masks_max:
+            cache.popitem(last=False)
         return mask
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None,
@@ -583,16 +724,13 @@ class XOR8BitLM(nn.Module):
         if is_register is not None:
             h = h + self.register_bias.to(h.dtype) * is_register.unsqueeze(-1).to(h.dtype)
 
-        # Build attention mask
+        # Build attention mask (normalize shapes in blocks)
         if is_register is None:
-            mask = self._get_causal_mask(L, x.device)
+            mask = self._get_causal_mask(L, x.device)  # [L, L]
         else:
-            base = self._get_causal_mask(L, x.device)  # [L, L]
-            # Expand to [B, L, L]
-            mask = base.unsqueeze(0).expand(B, L, L).clone()
-            # Block attending to any register positions (for all queries)
-            mask |= is_register[:, None, :].expand(B, L, L)
-            # Note: this also blocks registers->registers as desired
+            base_mask = self._get_causal_mask(L, x.device)
+            register_mask = is_register.unsqueeze(1).expand(-1, L, -1)  # [B, L, L]
+            mask = base_mask.unsqueeze(0) | register_mask  # [B, L, L]
 
         # Key padding mask: True where token is PAD
         key_padding_mask = (x == self.encoder.PAD)
@@ -604,6 +742,128 @@ class XOR8BitLM(nn.Module):
         # Final norm and output
         h = self.norm(h)
         return self.out(h)
+
+    @torch.no_grad()
+    def forward_with_cache(self, x: torch.Tensor, positions: torch.Tensor | None = None,
+                           is_register: torch.Tensor | None = None,
+                           past_kv: Optional[List[tuple[torch.Tensor, torch.Tensor]]] = None):
+        """Forward that supports KV-cache for incremental generation.
+        x: [B, T]
+        positions: [B, T] float32 or None
+        past_kv: list of (k, v) per layer or None; k/v shapes [B, H, S, head_dim]
+        Returns: logits [B, T, V], new_past_kv
+        """
+        self.eval()
+        B, T = x.shape
+
+        bits = self.to_bits(x)
+        h = self.bit_proj(bits)
+
+        if is_register is not None:
+            h = h + self.register_bias.to(h.dtype) * is_register.unsqueeze(-1).to(h.dtype)
+
+        # Mask: causal only for generation; MuToR masking not used in generation
+        mask = None
+
+        new_past: List[tuple[torch.Tensor, torch.Tensor]] = []
+        use_incremental = past_kv is not None and T == 1
+
+        if not use_incremental:
+            # Full pass build and collect K/V
+            for i, layer in enumerate(self.layers):
+                h, k_present, v_present = layer.full_pass_return_kv(h, mask, None, positions=positions)
+                new_past.append((k_present, v_present))
+        else:
+            # Incremental
+            assert positions is not None, "positions must be provided for incremental generation"
+            for i, layer in enumerate(self.layers):
+                k_prev, v_prev = past_kv[i]
+                h, k_all, v_all = layer.forward_incremental(h, positions_last=positions, past_k=k_prev, past_v=v_prev)
+                new_past.append((k_all, v_all))
+
+        h = self.norm(h)
+        logits = self.out(h)
+        return logits, new_past
+
+    @torch.no_grad()
+    def generate_with_cache(self, prompt="", max_len=100, temp=1.0, top_p=0.9, debug=False):
+        """Top-p sampling with KV-cache optimized for MPS/CPU."""
+        self.eval()
+        device = next(self.parameters()).device
+
+        seq = self.encoder.encode(prompt)
+        if len(seq) > 0 and seq[-1] == self.encoder.EOS:
+            seq = seq[:-1]
+        x = torch.from_numpy(seq).long().unsqueeze(0).to(device)
+
+        past_kv = None
+        # Running absolute positions for RoPE/tau
+        cur_len = x.size(1)
+        pos = torch.arange(cur_len, device=device, dtype=torch.float32).unsqueeze(0)
+
+        # Prime cache with initial context
+        logits, past_kv = self.forward_with_cache(x, positions=pos, is_register=None, past_kv=None)
+
+        for _ in range(max_len):
+            # Last token logits
+            last_logits = logits[:, -1, :] / temp
+            last_logits[..., self.encoder.START] = -float('inf')
+            last_logits[..., self.encoder.PAD] = -float('inf')
+            last_logits[..., self.encoder.REGISTER] = -float('inf')
+
+            if not torch.isfinite(last_logits).any():
+                last_logits = torch.zeros_like(last_logits)
+                last_logits[..., :256] = 1.0
+                last_logits[..., self.encoder.EOS] = 1.0
+                last_logits[..., self.encoder.START] = -float('inf')
+                last_logits[..., self.encoder.PAD] = -float('inf')
+                last_logits[..., self.encoder.REGISTER] = -float('inf')
+                if debug:
+                    print("[gen-cache] fallback logits")
+
+            sorted_logits, sorted_idx = torch.sort(last_logits, descending=True)
+            sorted_logits = torch.where(
+                torch.isfinite(sorted_logits), sorted_logits, torch.full_like(sorted_logits, -1e10)
+            )
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumsum = torch.cumsum(sorted_probs, dim=-1)
+            keep_mask = cumsum <= top_p
+            keep_mask[..., 0] = True
+            sorted_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -float('inf')))
+            probs = F.softmax(sorted_logits, dim=-1)
+
+            if not torch.isfinite(probs).all() or (probs < 0).any() or probs.sum() == 0:
+                probs = torch.zeros_like(last_logits)
+                probs[..., :256] = 1.0 / 256
+                probs[..., self.encoder.EOS] = 0.01
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+                next_token = torch.multinomial(probs, 1)
+                if debug:
+                    print("[gen-cache] fallback probs")
+            else:
+                next_token_sorted = torch.multinomial(probs, 1)
+                next_token = sorted_idx.gather(-1, next_token_sorted)
+
+            if next_token.item() == self.encoder.EOS:
+                break
+
+            # Update sequence and run incremental step
+            x_next = next_token
+            x = torch.cat([x, x_next], dim=1)
+            cur_len += 1
+            pos_next = torch.tensor([[cur_len - 1]], device=device, dtype=torch.float32)
+
+            logits, past_kv = self.forward_with_cache(x_next, positions=pos_next, is_register=None, past_kv=past_kv)
+
+            if debug:
+                last_tokens = x[0, -4:].tolist() if x.size(1) >= 4 else x[0].tolist()
+                token_id = next_token.item()
+                special = 'EOS' if token_id == self.encoder.EOS else (
+                    'START' if token_id == self.encoder.START else (
+                    'PAD' if token_id == self.encoder.PAD else ''))
+                print(f"[gen-cache] last={last_tokens} -> next={token_id}{'('+special+')' if special else ''}")
+
+        return self.encoder.decode(x[0].cpu().numpy())
 
     @torch.no_grad()
     def generate(self, prompt="", max_len=100, temp=1.0, top_p=0.9, debug=False):
@@ -629,8 +889,7 @@ class XOR8BitLM(nn.Module):
             # Prevent sampling of START, PAD, and REGISTER tokens
             logits[..., self.encoder.START] = -float('inf')
             logits[..., self.encoder.PAD] = -float('inf')
-            if hasattr(self, 'encoder.REGISTER'):
-                logits[..., self.enoder.REGISTER] = -float('inf')
+            logits[..., self.encoder.REGISTER] = -float('inf')
 
             # Check if we have any valid logits
             if not torch.isfinite(logits).any():
@@ -640,8 +899,7 @@ class XOR8BitLM(nn.Module):
                 logits[..., self.encoder.EOS] = 1.0  # Allow EOS
                 logits[..., self.encoder.START] = -float('inf')
                 logits[..., self.encoder.PAD] = -float('inf')
-                if hasattr(self, 'encoder.REGISTER'):
-                    logits[..., self.encoder.REGISTER] = -float('inf')
+                logits[..., self.encoder.REGISTER] = -float('inf')
                 if debug:
                     print("[gen] fallback logits -> uniform over bytes + EOS; masked START/PAD")
 
@@ -977,13 +1235,14 @@ def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8
     aug_batch[:, 1::2] = int(model.encoder.REGISTER)
 
     # Positions for RoPE
-    positions = torch.zeros((B, L2), device=device, dtype=torch.long)
+    # Keep integer math for indices, cast to float32 for model consumption
+    positions = torch.zeros((B, L2), device=device, dtype=torch.float32)
     # Even (original tokens): 0..L-1
     base_pos = torch.arange(L, device=device, dtype=torch.long)
-    positions[:, 0::2] = base_pos
+    positions[:, 0::2] = base_pos.to(torch.float32)
     # Odd (registers): pos = min(p + d - 1, L - 1)
     reg_pos = torch.clamp(base_pos + (d - 1), max=L - 1)
-    positions[:, 1::2] = reg_pos
+    positions[:, 1::2] = reg_pos.to(torch.float32)
 
     is_register = (aug_batch == int(model.encoder.REGISTER))
 
@@ -1002,30 +1261,26 @@ def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8
     return aug_batch, positions, is_register, aug_targets
 
 
-def compute_mutor_loss(logits: torch.Tensor, aug_targets: torch.Tensor, is_register: torch.Tensor,
-                       pad_id: int, alpha: float = 0.3) -> torch.Tensor:
-    """Combine next-token and register CE losses with weight alpha.
-    logits: [B, L2, V], aug_targets: [B, L2], is_register: [B, L2] (bool)
-    """
+def compute_mutor_loss(logits, aug_targets, is_register, pad_id, alpha=0.3):
+    """Corrected MuToR loss computation."""
     B, L2, V = logits.shape
     logits_f = logits.reshape(B * L2, V)
     targets_f = aug_targets.reshape(B * L2)
     is_reg_f = is_register.reshape(B * L2)
 
-    # Masks
     valid = targets_f != pad_id
-    mask_nt = (~is_reg_f) & valid
-    mask_reg = is_reg_f & valid
 
-    loss_nt = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-    loss_reg = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    if not valid.any():
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
-    if mask_nt.any():
-        loss_nt = F.cross_entropy(logits_f[mask_nt], targets_f[mask_nt])
-    if mask_reg.any():
-        loss_reg = F.cross_entropy(logits_f[mask_reg], targets_f[mask_reg])
+    # Compute per-element losses
+    losses = F.cross_entropy(logits_f[valid], targets_f[valid], reduction='none')
 
-    return (1.0 - alpha) * loss_nt + alpha * loss_reg
+    # Apply weights
+    weights = torch.where(is_reg_f[valid], alpha, 1.0 - alpha)
+    weighted_loss = (losses * weights).mean()
+
+    return weighted_loss
 
 def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] = None, checkpoint: bool = False):
     """Save model and config - updated for RoPE model."""
@@ -1335,7 +1590,7 @@ CORIOLANUS:
     print(f"Decoded length: {len(decoded)}")
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
-    test_run = False
+    test_run = True
 
     if test_run:
         model = train(
@@ -1365,16 +1620,16 @@ CORIOLANUS:
             test_prompt="The "
         )
 
-    output = model.generate(input_text, max_len=200)
+    output = model.generate_with_cache(input_text, max_len=200)
     print(f"\nGenerated:\n{output}")
 
-    output = model.generate("The world is a cold place.", max_len=512)
+    output = model.generate_with_cache("The world is a cold place.", max_len=512)
     print(f"\nGenerated: {output}")
 
-    output = model.generate("Maailm on karm.", max_len=512)
+    output = model.generate_with_cache("Maailm on karm.", max_len=512)
     print(f"\nGenerated: {output}")
 
-    output = model.generate("Elu on ilus.", max_len=512)
+    output = model.generate_with_cache("Elu on ilus.", max_len=512)
     print(f"\nGenerated: {output}")
 
     # Or train from HuggingFace
