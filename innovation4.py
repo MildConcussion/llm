@@ -35,18 +35,21 @@ def partition_heads_golden(n_heads, n_groups):
 
     φ = (1 + np.sqrt(5)) / 2
 
-    # Create golden-ratio weighted partitions
-    weights = [φ ** (n_groups - 1 - i) for i in range(n_groups)]
-    weights = np.array(weights) / sum(weights)
+    # Create golden-ratio weighted partitions (largest-remainder method)
+    weights = np.array([φ ** (n_groups - 1 - i) for i in range(n_groups)], dtype=np.float64)
+    weights = weights / weights.sum()
 
-    # Calculate group sizes
-    sizes = np.round(weights * n_heads).astype(int)
+    raw = weights * n_heads
+    floor_sizes = np.floor(raw).astype(int)
+    remainder = raw - floor_sizes
 
-    # Adjust to ensure sum equals n_heads
-    diff = n_heads - sizes.sum()
-    if diff != 0:
-        # Add/subtract from the middle group for balance
-        sizes[len(sizes)//2] += diff
+    # Distribute remaining heads to groups with largest fractional parts
+    remaining = int(n_heads - floor_sizes.sum())
+    if remaining > 0:
+        idx = np.argsort(-remainder)
+        floor_sizes[idx[:remaining]] += 1
+
+    sizes = floor_sizes
 
     # Create head index groups
     groups = []
@@ -60,22 +63,80 @@ def partition_heads_golden(n_heads, n_groups):
 
 # Even more concise version using vectorization
 def golden_groups(n_layers, n_heads=8, min_groups=2, max_groups=4):
-    """Ultra-fast vectorized version using NumPy."""
+    """Endpoint-correct vectorized schedule.
+
+    Guarantees first layer uses ``max_groups`` and last layer uses ``min_groups``
+    (when ``n_layers > 1``). Also caps group counts by ``n_heads``.
+    """
     φ = (1 + np.sqrt(5)) / 2
 
-    # Exponential decay of group count based on layer depth
-    layer_positions = np.arange(n_layers) / max(1, n_layers - 1)
-    n_groups = np.round(max_groups * np.exp(-layer_positions * np.log(φ)) +
-                       min_groups * (1 - np.exp(-layer_positions * np.log(φ)))).astype(int)
-    n_groups = np.clip(n_groups, min_groups, max_groups)
+    # Clamp feasible bounds by n_heads
+    max_g = int(min(max_groups, n_heads))
+    min_g = int(max(1, min(min_groups, max_g)))
 
-    # Pre-compute all possible group configurations
-    cache = {}
-    for ng in range(min_groups, max_groups + 1):
-        cache[ng] = partition_heads_golden(n_heads, ng)
+    if n_layers <= 0:
+        return []
 
-    # Map to groups
-    return [cache[ng] for ng in n_groups]
+    if n_layers == 1:
+        # Single layer: use the tighter of max_g and n_heads
+        ng = max_g
+        return [partition_heads_golden(n_heads, ng)]
+
+    # Geometric decay over layers (0..L-1), normalized to hit endpoints exactly
+    idx = np.arange(n_layers)
+    geom = φ ** (-idx)
+    # Normalize to [0,1] with f[0]=1, f[-1]=0
+    f = (geom - geom[-1]) / (geom[0] - geom[-1])
+
+    n_groups = np.round(min_g + (max_g - min_g) * f).astype(int)
+    # Enforce endpoints in case rounding drifted
+    n_groups[0] = max_g
+    n_groups[-1] = min_g
+
+    # Monotone non-increasing (defensive smoothing)
+    for i in range(1, n_layers):
+        if n_groups[i] > n_groups[i-1]:
+            n_groups[i] = n_groups[i-1]
+
+    # Asymmetric per-layer partitioning using φ-phase weighting and head rotation
+    golden_conjugate = φ - 1.0  # ≈ 0.618...
+
+    groups_per_layer = []
+    for i, ng in enumerate(n_groups.tolist()):
+        ng = int(ng)
+        # Phase in [0,1) advances quasi-uniformly across layers
+        phase = (i * golden_conjugate) % 1.0
+
+        # φ-phase shifted weights: w_j ∝ φ^{-(j + phase)}
+        j = np.arange(max(ng, 1), dtype=np.float64)
+        weights = φ ** (-(j + phase))
+        weights = weights / weights.sum()
+
+        # Largest-remainder allocation for sizes
+        raw = weights * n_heads
+        floor_sizes = np.floor(raw).astype(int)
+        remainder = raw - floor_sizes
+        remaining = int(n_heads - floor_sizes.sum())
+        if remaining > 0:
+            idx = np.argsort(-remainder)
+            floor_sizes[idx[:remaining]] += 1
+        sizes = floor_sizes
+
+        # Rotate head indices by a φ-based offset for asymmetric membership
+        rotate_by = int(np.floor(phase * n_heads)) % max(1, n_heads)
+        head_ring = np.roll(np.arange(n_heads, dtype=int), rotate_by)
+
+        # Form contiguous groups on the rotated ring
+        groups = []
+        start = 0
+        for sz in sizes:
+            if sz > 0:
+                groups.append(head_ring[start:start+sz].tolist())
+                start += sz
+
+        groups_per_layer.append(groups)
+
+    return groups_per_layer
 
 
 # ============= ENCODER =============
@@ -339,10 +400,6 @@ class AsymGQATransformerBlock(nn.Module):
         # Reshape for broadcasting across sequence dim (no transpose)
         q_temps = q_temps.to(dtype=q.dtype, device=q.device).unsqueeze(1)  # [B, 1, L, 1]
         v_temps = v_temps.to(dtype=v.dtype, device=v.device).unsqueeze(1)  # [B, 1, L, 1]
-
-        if os.getenv('DEBUG_TEMP') == '1':
-            print(f"[debug] q.shape={q.shape}, q_temps.shape={q_temps.shape}")
-            print(f"[debug] v.shape={v.shape}, v_temps.shape(before expand)={v_temps.shape}")
 
         # Scale queries (controls attention spikiness)
         q = q * q_temps
@@ -1074,7 +1131,7 @@ CORIOLANUS:
         epochs=5,
         d_model=512,
         n_heads=8,
-        n_layers=10,
+        n_layers=8,
         rope_base=10000)
 
     output = model.generate(input_text, max_len=200)
