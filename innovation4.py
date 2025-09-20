@@ -17,6 +17,68 @@ import contextlib
 from tqdm import tqdm
 from grokadamw import GrokAdamW
 
+
+
+
+def partition_heads_golden(n_heads, n_groups):
+    """
+    Partition heads into groups using Golden ratio proportions.
+
+    Args:
+        n_heads: Number of heads to partition
+        n_groups: Number of groups to create
+
+    Returns:
+        List of head index groups
+    """
+    if n_groups == 1:
+        return [list(range(n_heads))]
+
+    φ = (1 + np.sqrt(5)) / 2
+
+    # Create golden-ratio weighted partitions
+    weights = [φ ** (n_groups - 1 - i) for i in range(n_groups)]
+    weights = np.array(weights) / sum(weights)
+
+    # Calculate group sizes
+    sizes = np.round(weights * n_heads).astype(int)
+
+    # Adjust to ensure sum equals n_heads
+    diff = n_heads - sizes.sum()
+    if diff != 0:
+        # Add/subtract from the middle group for balance
+        sizes[len(sizes)//2] += diff
+
+    # Create head index groups
+    groups = []
+    start = 0
+    for size in sizes:
+        if size > 0:  # Only add non-empty groups
+            groups.append(list(range(start, start + size)))
+            start += size
+
+    return groups
+
+# Even more concise version using vectorization
+def golden_groups(n_layers, n_heads=8, min_groups=2, max_groups=4):
+    """Ultra-fast vectorized version using NumPy."""
+    φ = (1 + np.sqrt(5)) / 2
+
+    # Exponential decay of group count based on layer depth
+    layer_positions = np.arange(n_layers) / max(1, n_layers - 1)
+    n_groups = np.round(max_groups * np.exp(-layer_positions * np.log(φ)) +
+                       min_groups * (1 - np.exp(-layer_positions * np.log(φ)))).astype(int)
+    n_groups = np.clip(n_groups, min_groups, max_groups)
+
+    # Pre-compute all possible group configurations
+    cache = {}
+    for ng in range(min_groups, max_groups + 1):
+        cache[ng] = partition_heads_golden(n_heads, ng)
+
+    # Map to groups
+    return [cache[ng] for ng in n_groups]
+
+
 # ============= ENCODER =============
 
 class GrayCodeEncoder:
@@ -281,13 +343,9 @@ class XOR8BitLM(nn.Module):
         head_dim = d_model // n_heads
         self.rope = RotaryEmbedding(head_dim, max_len, rope_base)
 
-        groups_per_layer = [
-            [[0,1], [2,3], [4,5], [6,7]] if i < 2 else  # Early: 4 KV
-            [[0,1,2], [3,4,5], [6,7]] if i < 4 else     # Mid: 3 KV
-            [[0,1], [2,3,4], [5,6,7]] if i < 6 else     # Mid: 3 KV
-            [[0,1,2,3], [4,5,6,7]]                      # Late: 2 KV
-            for i in range(n_layers)
-        ]
+        groups_per_layer = golden_groups(n_layers, n_heads=n_heads)
+        for i, g in enumerate(groups_per_layer):
+            print(f"Layer {i}: {g} (KV groups: {len(g)})")
 
         self.layers = nn.ModuleList([
             AsymGQATransformerBlock(d_model, n_heads, d_model * 4, self.rope, groups)

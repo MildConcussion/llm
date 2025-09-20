@@ -157,11 +157,14 @@ class GrokAdamW(Optimizer):
                 # Bias correction (pre-compute for efficiency)
                 bias_correction1 = 1 - beta1 ** step
                 bias_correction2 = 1 - beta2 ** step
-                step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+                # Use numerically stable ordering per bnb Adam reasoning
+                sqrt_bias_correction2 = math.sqrt(bias_correction2)
+                step_size = lr * sqrt_bias_correction2 / bias_correction1
 
                 # Update parameters (fused operations)
                 p.mul_(1 - lr * weight_decay)
-                denom = exp_avg_sq.sqrt().add_(eps)
+                # Compute denom as sqrt(v) + eps * sqrt(bias_correction2) for better FP stability
+                denom = exp_avg_sq.sqrt().add_(eps * sqrt_bias_correction2)
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
     def state_dict(self):
