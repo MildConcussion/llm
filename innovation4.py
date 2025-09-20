@@ -101,7 +101,7 @@ def golden_groups(n_layers, n_heads=8, min_groups=2, max_groups=4):
         if n_groups[i] > n_groups[i-1]:
             n_groups[i] = n_groups[i-1]
 
-    # Asymmetric per-layer partitioning using φ-phase weighting and head rotation
+    # Asymmetric per-layer partitioning using φ-phase weighting (anchored, no rotation)
     golden_conjugate = φ - 1.0  # ≈ 0.618...
 
     groups_per_layer = []
@@ -110,26 +110,21 @@ def golden_groups(n_layers, n_heads=8, min_groups=2, max_groups=4):
         # Phase in [0,1) advances quasi-uniformly across layers
         phase = (i * golden_conjugate) % 1.0
 
-        # φ-phase shifted weights: w_j ∝ φ^{-(j + phase)}
-        j = np.arange(max(ng, 1), dtype=np.float64)
-        weights = φ ** (-(j + phase))
-        weights = weights / weights.sum()
+        # Start from canonical golden sizes for this ng
+        base_groups = partition_heads_golden(n_heads, ng)
+        base_sizes = np.array([len(g) for g in base_groups], dtype=int)
 
-        # Largest-remainder allocation for sizes
-        raw = weights * n_heads
-        floor_sizes = np.floor(raw).astype(int)
-        remainder = raw - floor_sizes
-        remaining = int(n_heads - floor_sizes.sum())
-        if remaining > 0:
-            idx = np.argsort(-remainder)
-            floor_sizes[idx[:remaining]] += 1
-        sizes = floor_sizes
+        # Permute sizes by φ-phase: assign larger sizes to positions determined by sorted keys
+        positions = np.arange(len(base_sizes), dtype=np.float64)
+        keys = np.mod(positions * golden_conjugate + phase, 1.0)
+        order = np.argsort(keys)  # ascending order of keys
+        sizes_sorted = np.sort(base_sizes)[::-1]  # largest to smallest
+        sizes = np.empty_like(base_sizes)
+        for rank, pos in enumerate(order):
+            sizes[pos] = sizes_sorted[rank]
 
-        # Rotate head indices by a φ-based offset for asymmetric membership
-        rotate_by = int(np.floor(phase * n_heads)) % max(1, n_heads)
-        head_ring = np.roll(np.arange(n_heads, dtype=int), rotate_by)
-
-        # Form contiguous groups on the rotated ring
+        # Form contiguous groups anchored at head index 0 (no rotation)
+        head_ring = np.arange(n_heads, dtype=int)
         groups = []
         start = 0
         for sz in sizes:
@@ -998,7 +993,7 @@ def compute_mutor_loss(logits: torch.Tensor, aug_targets: torch.Tensor, is_regis
 
     return (1.0 - alpha) * loss_nt + alpha * loss_reg
 
-def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] = None):
+def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] = None, checkpoint: bool = False):
     """Save model and config - updated for RoPE model."""
     path = Path(path)
     path.mkdir(exist_ok=True, parents=True)
@@ -1028,7 +1023,10 @@ def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] 
         json.dump(config, f, indent=2)
 
     # Save weights
-    torch.save(model.state_dict(), path / 'model.pt')
+    if checkpoint:
+        torch.save(model.state_dict(), path / 'model_checkpoint.pt')
+    else:
+        torch.save(model.state_dict(), path / 'model.pt')
 
 def load_model(path: Union[str, Path], device='cuda') -> XOR8BitLM:
     """Load model from checkpoint."""
@@ -1071,6 +1069,7 @@ def train(
     val_packed_dirs: Optional[List[Union[str, Path]]] = None,
     mixing_policy: str = 'round_robin',  # 'round_robin' or 'weighted'
     mixing_weights: Optional[List[float]] = None,
+    test_prompt: str = "The ",
 ):
     """Complete training pipeline."""
 
@@ -1220,7 +1219,7 @@ def train(
             print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
 
         # Save checkpoint
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 1 == 0:
             save_model(model, model_path, {
                 'd_model': model.d_model,
                 'n_heads': model.n_heads,
@@ -1229,11 +1228,11 @@ def train(
                 'rope_base': model.rope.base,
                 'best_perplexity': trainer.metrics.best_perp,
                 'epoch': epoch + 1
-            })
+            }, checkpoint=True)
 
         # Generate sample
         model.eval()
-        sample = model.generate("The ", max_len=60)
+        sample = model.generate(test_prompt, max_len=60)
         print(f"\nSample: {sample}\n")
 
     # Final save
@@ -1302,22 +1301,47 @@ CORIOLANUS:
     print(f"Decoded length: {len(decoded)}")
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
-    # Train example (uncomment to run)
-    model = train(
-        "data/tiny_shakespeare.txt",
-        seq_length=512,
-        batch_size=8,
-        epochs=5,
-        d_model=512,
-        n_heads=8,
-        n_layers=8,
-        rope_base=10000)
+    test_run = True
+
+    if test_run:
+        model = train(
+            "data/tiny_shakespeare.txt",
+            seq_length=512,
+            batch_size=8,
+            epochs=5,
+            d_model=512,
+            n_heads=8,
+            n_layers=8,
+            rope_base=10000,
+            test_prompt="The "
+        )
+    else:
+        # Train example (uncomment to run)
+        model = train(
+            "datasets/packed",
+            packed_dirs=["datasets/packed/train"],
+            val_packed_dirs=["datasets/packed/val"],
+            seq_length=512,
+            batch_size=8,
+            epochs=5,
+            d_model=512,
+            n_heads=8,
+            n_layers=8,
+            rope_base=10000,
+            test_prompt="See "
+        )
 
     output = model.generate(input_text, max_len=200)
     print(f"\nGenerated:\n{output}")
 
-    output = model.generate("The world is a cold place.", max_len=200)
-    print(f"\nGenerated (trained, unrepresented text): {output}")
+    output = model.generate("The world is a cold place.", max_len=512)
+    print(f"\nGenerated: {output}")
+
+    output = model.generate("Maailm on karm.", max_len=512)
+    print(f"\nGenerated: {output}")
+
+    output = model.generate("Elu on ilus.", max_len=512)
+    print(f"\nGenerated: {output}")
 
     # Or train from HuggingFace
     # model = train_from_hf("wikitext", "wikitext-2-raw-v1", epochs=5)
