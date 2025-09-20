@@ -250,16 +250,25 @@ class RotaryEmbedding(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
 
-    def forward(self, q, k, seq_len=None):
+    def forward(self, q, k, seq_len=None, positions: torch.Tensor | None = None):
         """Apply rotary embeddings to queries and keys.
         Input shape: [B, H, L, head_dim]
+        If positions is provided (Tensor[B, L]), compute cos/sin per batch using inv_freq.
         """
         if seq_len is None:
             seq_len = q.shape[2]  # Note: shape[2] because input is [B, H, L, head_dim]
 
-        # Use precomputed values
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
+        if positions is None:
+            # Use precomputed values
+            cos = self.cos_cached[:, :, :seq_len, :]
+            sin = self.sin_cached[:, :, :seq_len, :]
+        else:
+            # Compute per-batch cos/sin from provided positions
+            # positions: [B, L] -> freqs: [B, L, dim/2]
+            freqs = torch.einsum('bl,d->bld', positions.to(self.inv_freq.dtype), self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)  # [B, L, dim]
+            cos = emb.cos().unsqueeze(1)  # [B, 1, L, dim]
+            sin = emb.sin().unsqueeze(1)  # [B, 1, L, dim]
 
         # Apply rotation using complex number properties
         q_embed = (q * cos) + (self.rotate_half(q) * sin)
@@ -385,7 +394,7 @@ class AsymGQATransformerBlock(nn.Module):
                 kv_map[q_idx] = kv_idx
         return kv_map
 
-    def forward(self, x, mask=None, key_padding_mask=None):
+    def forward(self, x, mask=None, key_padding_mask=None, positions: torch.Tensor | None = None):
         B, L, D = x.shape
 
         # Pre-norm
@@ -414,14 +423,18 @@ class AsymGQATransformerBlock(nn.Module):
         k = k[:, self.kv_map]  # [B, n_heads, L, head_dim]
         v = v[:, self.kv_map]
 
-        # Apply RoPE
-        q, k = self.rope(q, k, seq_len=L)
+        # Apply RoPE (optionally with custom positions)
+        q, k = self.rope(q, k, seq_len=L, positions=positions)
 
         # Standard attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         if mask is not None:
-            scores.masked_fill_(mask[None, None, :, :], -float('inf'))
+            # Support [L, L] or [B, L, L]
+            if mask.dim() == 2:
+                scores.masked_fill_(mask[None, None, :, :], -float('inf'))
+            else:
+                scores.masked_fill_(mask[:, None, :, :], -float('inf'))
         if key_padding_mask is not None:
             scores.masked_fill_(key_padding_mask[:, None, None, :], -float('inf'))
 
@@ -439,22 +452,40 @@ class AsymGQATransformerBlock(nn.Module):
 
 
 class XOR8BitLM(nn.Module):
-    """Fast XOR-based Language Model."""
+    """Fast XOR-based Language Model with optional MuToR."""
 
     def __init__(self, d_model=512, n_heads=8, n_layers=6,
-                 max_len=2048, rope_base=10000):
+                 max_len=2048, rope_base=10000,
+                 mutor_dmax: int = 0, mutor_alpha: float = 0.3):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.encoder = GrayCodeEncoder()
-        # Precompute 8-bit lookup table [256, 8] for fast bit extraction
-        lut_vals = (torch.arange(256, dtype=torch.int64).unsqueeze(-1) >> torch.arange(8, dtype=torch.int64)) & 1
+        # MuToR configuration
+        self.mutor_dmax = int(mutor_dmax)
+        self.mutor_alpha = float(mutor_alpha)
+        self.register_id = 259  # New special token for MuToR register
+
+        # Precompute 8-bit lookup table [260, 8] for fast bit extraction
+        lut_vals = torch.zeros(260, 8, dtype=torch.int64)
+        byte_bits = (torch.arange(256, dtype=torch.int64).unsqueeze(-1) >> torch.arange(8, dtype=torch.int64)) & 1
+        lut_vals[:256] = byte_bits
+        # Special tokens bit patterns
+        lut_vals[GrayCodeEncoder.START, 0] = 1
+        lut_vals[GrayCodeEncoder.EOS, 1] = 1
+        # PAD remains all zeros
+        lut_vals[self.register_id, 2] = 1  # REGISTER unique bit
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
         # Cache for causal masks by (device, seq_len)
         self._causal_masks: dict[tuple[str, int], torch.Tensor] = {}
+        # Cache for base MuToR causal masks (per seq_len) to reuse across batch
+        self._mutor_base_masks: dict[tuple[str, int], torch.Tensor] = {}
 
         # Bit projection: 8 bits -> d_model
         self.bit_proj = nn.Linear(8, d_model)
+
+        # Single learnable register embedding (additive bias)
+        self.register_bias = nn.Parameter(torch.zeros(d_model))
 
         # RoPE for positional encoding
         if d_model % n_heads != 0 or ((d_model // n_heads) % 2 != 0):
@@ -476,8 +507,8 @@ class XOR8BitLM(nn.Module):
 
         self.norm = RMSNorm(d_model)
 
-        # Output head
-        self.out = nn.Linear(d_model, 259)
+        # Output head (now 260 including REGISTER)
+        self.out = nn.Linear(d_model, 260)
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -491,25 +522,9 @@ class XOR8BitLM(nn.Module):
     @torch.jit.export
     def to_bits(self, x: torch.Tensor) -> torch.Tensor:
         """Convert sequence to bit features (vectorized with LUT)."""
-        # Lookup bits for bytes 0..255
-        byte_bits = self.bit_lut[x.clamp(min=0, max=255)]  # [B, L, 8], float32
-
-        # Zero out any non-byte tokens (>=256) without host sync
-        non_byte_mask = (x >= 256)
-        if non_byte_mask.dtype != torch.bool:
-            non_byte_mask = non_byte_mask.bool()
-        byte_bits = byte_bits.masked_fill(non_byte_mask.unsqueeze(-1), 0.0)
-
-        # Overlay special tokens without conditional host syncs
-        # START (256): set bit 0 to 1
-        start_mask = (x == self.encoder.START)
-        byte_bits[..., 0] = torch.where(start_mask, torch.ones_like(byte_bits[..., 0]), byte_bits[..., 0])
-        # EOS (257): set bit 1 to 1
-        eos_mask = (x == self.encoder.EOS)
-        byte_bits[..., 1] = torch.where(eos_mask, torch.ones_like(byte_bits[..., 1]), byte_bits[..., 1])
-
-        # PAD (258) remains zeros due to non-byte zeroing above
-        return byte_bits
+        # Direct LUT indexing for 0..259 (bytes + specials + REGISTER)
+        x_clamped = x.clamp(min=0, max=self.bit_lut.shape[0] - 1)
+        return self.bit_lut[x_clamped]
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Return cached upper-triangular causal mask of shape [L, L] (bool)."""
@@ -520,22 +535,36 @@ class XOR8BitLM(nn.Module):
             self._causal_masks[key] = mask
         return mask
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with RoPE."""
+    def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None,
+                is_register: torch.Tensor | None = None) -> torch.Tensor:
+        """Forward pass with optional MuToR positions/registers support."""
         B, L = x.shape
 
         # Convert to bits and project
         bits = self.to_bits(x)
         h = self.bit_proj(bits)
 
-        # Create causal mask
-        mask = self._get_causal_mask(L, x.device)
+        # Add register bias where applicable
+        if is_register is not None:
+            h = h + self.register_bias.to(h.dtype) * is_register.unsqueeze(-1).to(h.dtype)
+
+        # Build attention mask
+        if is_register is None:
+            mask = self._get_causal_mask(L, x.device)
+        else:
+            base = self._get_causal_mask(L, x.device)  # [L, L]
+            # Expand to [B, L, L]
+            mask = base.unsqueeze(0).expand(B, L, L).clone()
+            # Block attending to any register positions (for all queries)
+            mask |= is_register[:, None, :].expand(B, L, L)
+            # Note: this also blocks registers->registers as desired
+
         # Key padding mask: True where token is PAD
         key_padding_mask = (x == self.encoder.PAD)
 
         # Apply transformer layers
         for layer in self.layers:
-            h = layer(h, mask, key_padding_mask)
+            h = layer(h, mask, key_padding_mask, positions=positions)
 
         # Final norm and output
         h = self.norm(h)
@@ -562,9 +591,11 @@ class XOR8BitLM(nn.Module):
             # Get logits
             logits = self(x)[:, -1, :] / temp
 
-            # Prevent sampling of START and PAD tokens
+            # Prevent sampling of START, PAD, and REGISTER tokens
             logits[..., self.encoder.START] = -float('inf')
             logits[..., self.encoder.PAD] = -float('inf')
+            if hasattr(self, 'register_id'):
+                logits[..., self.register_id] = -float('inf')
 
             # Check if we have any valid logits
             if not torch.isfinite(logits).any():
@@ -574,6 +605,8 @@ class XOR8BitLM(nn.Module):
                 logits[..., self.encoder.EOS] = 1.0  # Allow EOS
                 logits[..., self.encoder.START] = -float('inf')
                 logits[..., self.encoder.PAD] = -float('inf')
+                if hasattr(self, 'register_id'):
+                    logits[..., self.register_id] = -float('inf')
                 if debug:
                     print("[gen] fallback logits -> uniform over bytes + EOS; masked START/PAD")
 
@@ -809,8 +842,8 @@ class Trainer:
         self.perplexity = perplexity
         self.best_perplexity = min(self.best_perplexity, perplexity)
 
-    def train_step(self, batch: torch.Tensor) -> float:
-        """Single training step with mixed precision."""
+    def train_step(self, batch: torch.Tensor, use_mutor: bool = True) -> float:
+        """Single training step with mixed precision and optional MuToR."""
         batch = batch.to(self.device)
 
         # Prepare inputs and targets
@@ -818,14 +851,17 @@ class Trainer:
         targets = batch[:, 1:]
 
         with self.autocast_ctx:
-            logits = self.model(inputs)
-
-            # Entropy-weighted loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, 259),
-                targets.reshape(-1),
-                ignore_index=self.encoder.PAD
-            )
+            if use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0:
+                aug_batch, positions, is_register, aug_targets = mutor_augment_batch(inputs, targets, self.model, self.device)
+                logits = self.model(aug_batch, positions=positions, is_register=is_register)
+                loss = compute_mutor_loss(logits, aug_targets, is_register, self.encoder.PAD, alpha=self.model.mutor_alpha)
+            else:
+                logits = self.model(inputs)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    targets.reshape(-1),
+                    ignore_index=self.encoder.PAD
+                )
 
             # Scale for gradient accumulation
             loss = loss / self.grad_accum_steps
@@ -867,7 +903,7 @@ class Trainer:
         with self.autocast_ctx:
             logits = self.model(inputs)
             loss = F.cross_entropy(
-                logits.reshape(-1, 259),
+                logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
                 ignore_index=self.encoder.PAD,
                 reduction='none'
@@ -895,19 +931,88 @@ class Trainer:
 
 # ============= UTILS =============
 
+def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8BitLM, device: torch.device):
+    """Augment batch with interleaved REGISTER tokens and build positions/targets.
+    inputs: [B, L], targets: [B, L] (next-token targets for inputs)
+    Returns: aug_batch [B, L2], positions [B, L2], is_register [B, L2] (bool), aug_targets [B, L2]
+    """
+    B, L = inputs.shape
+    L2 = 2 * L - 1
+
+    # Sample offset d in [1, dmax]
+    dmax = max(1, getattr(model, 'mutor_dmax', 1))
+    d = int(torch.randint(1, dmax + 1, (1,), device=device).item())
+
+    aug_batch = torch.full((B, L2), model.encoder.PAD, device=device, dtype=torch.long)
+    aug_batch[:, 0::2] = inputs
+    aug_batch[:, 1::2] = int(model.register_id)
+
+    # Positions for RoPE
+    positions = torch.zeros((B, L2), device=device, dtype=torch.long)
+    # Even (original tokens): 0..L-1
+    base_pos = torch.arange(L, device=device, dtype=torch.long)
+    positions[:, 0::2] = base_pos
+    # Odd (registers): pos = min(p + d - 1, L - 1)
+    reg_pos = torch.clamp(base_pos + (d - 1), max=L - 1)
+    positions[:, 1::2] = reg_pos
+
+    is_register = (aug_batch == int(model.register_id))
+
+    # Build augmented targets
+    aug_targets = torch.full_like(aug_batch, model.encoder.PAD)
+    # Next-token targets at even indices
+    aug_targets[:, 0::2] = targets
+    # Register targets: token at index min(p + d, L - 1) from inputs
+    reg_target_idx = torch.clamp(base_pos + d, max=L - 1)
+    reg_targets = inputs[:, reg_target_idx]
+    aug_targets[:, 1::2] = reg_targets
+
+    if os.environ.get('MUTOR_DEBUG', '0') == '1':
+        print(f"[mutor] d={d}, L={L}, L2={L2}")
+
+    return aug_batch, positions, is_register, aug_targets
+
+
+def compute_mutor_loss(logits: torch.Tensor, aug_targets: torch.Tensor, is_register: torch.Tensor,
+                       pad_id: int, alpha: float = 0.3) -> torch.Tensor:
+    """Combine next-token and register CE losses with weight alpha.
+    logits: [B, L2, V], aug_targets: [B, L2], is_register: [B, L2] (bool)
+    """
+    B, L2, V = logits.shape
+    logits_f = logits.reshape(B * L2, V)
+    targets_f = aug_targets.reshape(B * L2)
+    is_reg_f = is_register.reshape(B * L2)
+
+    # Masks
+    valid = targets_f != pad_id
+    mask_nt = (~is_reg_f) & valid
+    mask_reg = is_reg_f & valid
+
+    loss_nt = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    loss_reg = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+    if mask_nt.any():
+        loss_nt = F.cross_entropy(logits_f[mask_nt], targets_f[mask_nt])
+    if mask_reg.any():
+        loss_reg = F.cross_entropy(logits_f[mask_reg], targets_f[mask_reg])
+
+    return (1.0 - alpha) * loss_nt + alpha * loss_reg
+
 def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] = None):
     """Save model and config - updated for RoPE model."""
     path = Path(path)
     path.mkdir(exist_ok=True, parents=True)
 
     # Save config
-    allowed_keys = {'d_model', 'n_heads', 'n_layers', 'max_len', 'rope_base'}
+    allowed_keys = {'d_model', 'n_heads', 'n_layers', 'max_len', 'rope_base', 'mutor_dmax', 'mutor_alpha'}
     default_config = {
         'd_model': model.d_model,
         'n_heads': model.n_heads,
         'n_layers': len(model.layers),
         'max_len': model.rope.max_seq_len,
-        'rope_base': model.rope.base
+        'rope_base': model.rope.base,
+        'mutor_dmax': getattr(model, 'mutor_dmax', 0),
+        'mutor_alpha': getattr(model, 'mutor_alpha', 0.3),
     }
     # Filter incoming config to contain only model constructor keys; fill missing from defaults
     if config is not None:
@@ -933,7 +1038,7 @@ def load_model(path: Union[str, Path], device='cuda') -> XOR8BitLM:
     with open(path / 'config.json', 'r') as f:
         loaded = json.load(f)
         # Be robust to extra metadata keys in older checkpoints
-        allowed_keys = {'d_model', 'n_heads', 'n_layers', 'max_len', 'rope_base'}
+        allowed_keys = {'d_model', 'n_heads', 'n_layers', 'max_len', 'rope_base', 'mutor_dmax', 'mutor_alpha'}
         config = {k: v for k, v in loaded.items() if k in allowed_keys}
 
     # Create model
