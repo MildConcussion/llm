@@ -4,6 +4,7 @@ Fast, elegant, vocabulary-free language modeling
 """
 
 import itertools
+import os
 import math
 import numpy as np
 import torch
@@ -16,8 +17,6 @@ import json
 import contextlib
 from tqdm import tqdm
 from grokadamw import GrokAdamW
-
-
 
 
 def partition_heads_golden(n_heads, n_groups):
@@ -239,6 +238,48 @@ class FeedForward(nn.Module):
         return self.fc3(x)
 
 
+class SelectiveAttentionModule(nn.Module):
+    """Lightweight SSA temperature module with weight sharing."""
+
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        # Single learnable parameter for position-aware scaling
+        self.pos_alpha = nn.Parameter(torch.zeros(1))
+        # Output projection for token-aware temperature (weight sharing with attention)
+        self.temp_out = nn.Linear(d_model, 1, bias=False)
+        nn.init.normal_(self.temp_out.weight, std=0.02)
+
+        # Precompute position scales
+        positions = torch.arange(1, max_len + 1, dtype=torch.float32)
+        self.register_buffer('log_positions', torch.log(positions))
+
+    def forward(self, x, proj_weight):
+        """
+        x: [B, L, D]
+        proj_weight: attention projection weights for weight sharing
+        Returns: [B, L, 1] temperature values
+        """
+        B, L, D = x.shape
+
+        # Token-aware temperature using shared attention weights
+        # Use the transpose of projection weights as feature extractor
+        # proj_weight shape: [out_dim, in_dim], we need [in_dim, hidden] for feature extraction
+        # So we use first d_model columns of the transposed weight
+        weight_t = proj_weight.t()[:D, :min(D, proj_weight.shape[0])]  # [d_model, hidden_dim]
+        features = F.linear(x, weight_t.t())  # [B, L, hidden_dim]
+
+        # Apply GeLU and project to scalar temperature
+        features_gelu = F.gelu(features)
+        # Average pool over hidden dimension then project to scalar
+        features_pooled = features_gelu.mean(dim=-1, keepdim=True)  # [B, L, 1]
+        token_temp = torch.tanh(features_pooled)  # [B, L, 1]
+
+        # Position-aware temperature
+        pos_scale = 1 + torch.sigmoid(self.pos_alpha) * self.log_positions[:L].unsqueeze(0).unsqueeze(-1)
+
+        return token_temp * pos_scale
+
+
 class AsymGQATransformerBlock(nn.Module):
     """Transformer with Asymmetric Grouped-Query Attention"""
 
@@ -269,6 +310,9 @@ class AsymGQATransformerBlock(nn.Module):
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
 
+        self.q_temp_module = SelectiveAttentionModule(d_model)
+        self.v_temp_module = SelectiveAttentionModule(d_model)
+
     def _create_kv_map(self):
         """Create index mapping from Q heads to KV heads"""
         kv_map = torch.zeros(self.n_heads, dtype=torch.long)
@@ -287,6 +331,24 @@ class AsymGQATransformerBlock(nn.Module):
         q = self.q_proj(x_norm).reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x_norm).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x_norm).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Get temperatures using weight sharing
+        q_temps = self.q_temp_module(x_norm, self.q_proj.weight)  # [B, L, 1]
+        v_temps = self.v_temp_module(x_norm, self.v_proj.weight)  # [B, L, 1]
+
+        # Reshape for broadcasting across sequence dim (no transpose)
+        q_temps = q_temps.to(dtype=q.dtype, device=q.device).unsqueeze(1)  # [B, 1, L, 1]
+        v_temps = v_temps.to(dtype=v.dtype, device=v.device).unsqueeze(1)  # [B, 1, L, 1]
+
+        if os.getenv('DEBUG_TEMP') == '1':
+            print(f"[debug] q.shape={q.shape}, q_temps.shape={q_temps.shape}")
+            print(f"[debug] v.shape={v.shape}, v_temps.shape(before expand)={v_temps.shape}")
+
+        # Scale queries (controls attention spikiness)
+        q = q * q_temps
+
+        # Scale values (suppresses noise)
+        v = v * v_temps.expand(-1, self.n_kv_heads, -1, -1)
 
         # Expand K,V to match Q heads using pre-computed mapping
         k = k[:, self.kv_map]  # [B, n_heads, L, head_dim]
@@ -329,7 +391,7 @@ class XOR8BitLM(nn.Module):
         lut_vals = (torch.arange(256, dtype=torch.int64).unsqueeze(-1) >> torch.arange(8, dtype=torch.int64)) & 1
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
         # Cache for causal masks by (device, seq_len)
-        self._causal_masks: dict[tuple[int, int], torch.Tensor] = {}
+        self._causal_masks: dict[tuple[str, int], torch.Tensor] = {}
 
         # Bit projection: 8 bits -> d_model
         self.bit_proj = nn.Linear(8, d_model)
@@ -391,7 +453,7 @@ class XOR8BitLM(nn.Module):
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Return cached upper-triangular causal mask of shape [L, L] (bool)."""
-        key = (id(device), seq_len)
+        key = (str(device), seq_len)
         mask = self._causal_masks.get(key)
         if mask is None or mask.device != device:
             mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), 1)
@@ -558,6 +620,14 @@ class Trainer:
         self.model = model.to(device)
         self.device = device
         self.grad_accum_steps = grad_accum_steps
+
+        print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
+
+        print("\nModel architecture:")
+        print(model)
+
+        output = model.generate("Test", max_len=20)
+        print(f"\nGenerated (untrained): {output}")
 
         self.metrics = StreamingGrokMetrics(alpha=ema_alpha)
 
@@ -827,6 +897,7 @@ def train(
     batch_size: int = 32,
     epochs: int = 10,
     lr: float = 3e-4,
+    rope_base: int = 10000,
     eval_interval: int = 10,  # Eval every N training steps
     ema_alpha: float = 0.99,  # EMA decay rate
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu',
@@ -852,7 +923,7 @@ def train(
                            num_workers=1, persistent_workers=True, pin_memory=(device=='cuda'))
 
     # Create model
-    model = XOR8BitLM(d_model, n_heads, n_layers, seq_length)
+    model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base)
 
     # Compile for speed (PyTorch 2.0+)
     if compile_model and hasattr(torch, 'compile'):
@@ -995,27 +1066,16 @@ CORIOLANUS:
     print(f"Decoded length: {len(decoded)}")
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
-    # Test model
-    model = XOR8BitLM(d_model=512,
-    n_heads=8,
-    n_layers=8,
-    rope_base=10000)
-    device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-    model = model.to(device)
-
-    print("\nModel architecture:")
-    print(model)
-
-    # Test generation (untrained)
-    output = model.generate("Test", max_len=20)
-    print(f"\nGenerated (untrained): {output}")
-
-    print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
-
     # Train example (uncomment to run)
-    model = train("data/tiny_shakespeare.txt", seq_length=1024, batch_size=16, epochs=5)
-
-
+    model = train(
+        "data/tiny_shakespeare.txt",
+        seq_length=512,
+        batch_size=8,
+        epochs=5,
+        d_model=512,
+        n_heads=8,
+        n_layers=10,
+        rope_base=10000)
 
     output = model.generate(input_text, max_len=200)
     print(f"\nGenerated:\n{output}")
