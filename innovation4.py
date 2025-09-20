@@ -65,73 +65,111 @@ def partition_heads_golden(n_heads, n_groups):
     return groups
 
 # Even more concise version using vectorization
-def golden_groups(n_layers, n_heads=8, min_groups=2, max_groups=4):
-    """Endpoint-correct vectorized schedule.
+def golden_groups(n_layers, n_heads=8, min_group_size=1, max_group_size=3):
+    """Golden grouping with bounded group sizes for all layers.
 
-    Guarantees first layer uses ``max_groups`` and last layer uses ``min_groups``
-    (when ``n_layers > 1``). Also caps group counts by ``n_heads``.
+    - Each group's size is in [min_group_size, max_group_size].
+    - Number of groups k is the minimum needed to satisfy the max size constraint: k = ceil(n_heads / max_group_size).
+    - Sizes per layer are based on golden weights and allocated via largest remainder within capacity, then permuted per layer using φ-phase.
+    - Groups are contiguous and anchored at head index 0 (no rotation), but which heads get larger chunks alternates across layers.
     """
     φ = (1 + np.sqrt(5)) / 2
-
-    # Clamp feasible bounds by n_heads
-    max_g = int(min(max_groups, n_heads))
-    min_g = int(max(1, min(min_groups, max_g)))
+    golden_conjugate = φ - 1.0  # ≈ 0.618...
 
     if n_layers <= 0:
         return []
 
-    if n_layers == 1:
-        # Single layer: use the tighter of max_g and n_heads
-        ng = max_g
-        return [partition_heads_golden(n_heads, ng)]
+    # Determine feasible k (number of groups)
+    min_gs = int(max(1, min_group_size))
+    max_gs = int(max(1, max_group_size))
+    if min_gs > max_gs:
+        min_gs, max_gs = max_gs, min_gs
 
-    # Geometric decay over layers (0..L-1), normalized to hit endpoints exactly
-    idx = np.arange(n_layers)
-    geom = φ ** (-idx)
-    # Normalize to [0,1] with f[0]=1, f[-1]=0
-    f = (geom - geom[-1]) / (geom[0] - geom[-1])
+    k_min = int(np.ceil(n_heads / max_gs))
+    k_max = int(max(1, n_heads // min_gs))
+    if k_min > k_max:
+        # Infeasible constraints; relax by increasing k to k_min and letting some groups be size > min_gs
+        k = k_min
+    else:
+        k = k_min
 
-    n_groups = np.round(min_g + (max_g - min_g) * f).astype(int)
-    # Enforce endpoints in case rounding drifted
-    n_groups[0] = max_g
-    n_groups[-1] = min_g
+    # Base golden weights for k groups (largest first)
+    j = np.arange(k, dtype=np.float64)
+    base_weights = φ ** (-j)
+    base_weights = base_weights / base_weights.sum()
 
-    # Monotone non-increasing (defensive smoothing)
-    for i in range(1, n_layers):
-        if n_groups[i] > n_groups[i-1]:
-            n_groups[i] = n_groups[i-1]
+    # Compute a single canonical size vector within [min_gs, max_gs]
+    base_sizes = np.full(k, min_gs, dtype=int)
+    remaining = int(n_heads - base_sizes.sum())
+    capacities = np.full(k, max_gs - min_gs, dtype=int)
+    if remaining < 0:
+        # Should not happen with k = ceil(n_heads / max_gs), but guard
+        raise ValueError("Invalid group size constraints relative to n_heads")
 
-    # Asymmetric per-layer partitioning using φ-phase weighting (anchored, no rotation)
-    golden_conjugate = φ - 1.0  # ≈ 0.618...
+    if remaining > 0:
+        # Largest-remainder allocation within capacities
+        raw_add = base_weights * remaining
+        add_floor = np.floor(raw_add).astype(int)
+        # Respect capacities
+        add_floor = np.minimum(add_floor, capacities)
+        sizes = base_sizes + add_floor
+        leftover = remaining - add_floor.sum()
+        if leftover > 0:
+            rema = raw_add - add_floor
+            # Assign remaining heads by descending fractional remainder, honoring capacity
+            order = np.argsort(-rema)
+            for idx in order:
+                if leftover == 0:
+                    break
+                if sizes[idx] - base_sizes[idx] < capacities[idx]:
+                    sizes[idx] += 1
+                    leftover -= 1
+        else:
+            sizes = base_sizes
+    else:
+        sizes = base_sizes
 
+    # Defensive clamp and final adjustment if rounding drifted
+    sizes = np.clip(sizes, min_gs, max_gs)
+    diff = int(n_heads - sizes.sum())
+    if diff != 0:
+        # Add/subtract heads starting from largest-remainder preference while respecting bounds
+        direction = 1 if diff > 0 else -1
+        steps = abs(diff)
+        # Use remainders to guide distribution; if not available, use golden order
+        rema = (base_weights * n_heads) - np.floor(base_weights * n_heads)
+        order = np.argsort(-rema) if direction > 0 else np.argsort(rema)
+        for _ in range(steps):
+            for idx in order:
+                if direction > 0 and sizes[idx] < max_gs:
+                    sizes[idx] += 1
+                    break
+                if direction < 0 and sizes[idx] > min_gs:
+                    sizes[idx] -= 1
+                    break
+
+    # Build per-layer groups by permuting size order using φ-phase
     groups_per_layer = []
-    for i, ng in enumerate(n_groups.tolist()):
-        ng = int(ng)
-        # Phase in [0,1) advances quasi-uniformly across layers
+    for i in range(n_layers):
         phase = (i * golden_conjugate) % 1.0
-
-        # Start from canonical golden sizes for this ng
-        base_groups = partition_heads_golden(n_heads, ng)
-        base_sizes = np.array([len(g) for g in base_groups], dtype=int)
-
-        # Permute sizes by φ-phase: assign larger sizes to positions determined by sorted keys
-        positions = np.arange(len(base_sizes), dtype=np.float64)
+        positions = np.arange(len(sizes), dtype=np.float64)
         keys = np.mod(positions * golden_conjugate + phase, 1.0)
-        order = np.argsort(keys)  # ascending order of keys
-        sizes_sorted = np.sort(base_sizes)[::-1]  # largest to smallest
-        sizes = np.empty_like(base_sizes)
-        for rank, pos in enumerate(order):
-            sizes[pos] = sizes_sorted[rank]
+        pos_order = np.argsort(keys)  # ascending keys define placement order
 
-        # Form contiguous groups anchored at head index 0 (no rotation)
+        # Place sizes (largest first) into permuted positions
+        sizes_sorted = np.sort(sizes)[::-1]
+        sized_positions = np.empty_like(sizes)
+        for rank, pos in enumerate(pos_order):
+            sized_positions[pos] = sizes_sorted[rank]
+
+        # Form contiguous groups anchored at head index 0
         head_ring = np.arange(n_heads, dtype=int)
         groups = []
         start = 0
-        for sz in sizes:
+        for sz in sized_positions:
             if sz > 0:
                 groups.append(head_ring[start:start+sz].tolist())
                 start += sz
-
         groups_per_layer.append(groups)
 
     return groups_per_layer
@@ -142,7 +180,7 @@ def golden_groups(n_layers, n_heads=8, min_groups=2, max_groups=4):
 class GrayCodeEncoder:
     """Gray code preserves bit locality."""
 
-    START, EOS, PAD = 256, 257, 258
+    START, EOS, PAD, REGISTER = 256, 257, 258, 259
 
     def __init__(self):
         # Precompute Gray code lookup
@@ -168,6 +206,9 @@ class GrayCodeEncoder:
         gray_bytes = seq[mask]
         original = self.gray_inv[gray_bytes]
         return bytes(original.astype(np.uint8)).decode('utf-8', errors='ignore')
+
+    def __len__(self):
+        return len(self.gray_lut) + 4
 
 
 # ============= DATASET =============
@@ -459,17 +500,16 @@ class XOR8BitLM(nn.Module):
         # MuToR configuration
         self.mutor_dmax = int(mutor_dmax)
         self.mutor_alpha = float(mutor_alpha)
-        self.register_id = 259  # New special token for MuToR register
 
         # Precompute 8-bit lookup table [260, 8] for fast bit extraction
-        lut_vals = torch.zeros(260, 8, dtype=torch.int64)
+        lut_vals = torch.zeros(len(self.encoder), 8, dtype=torch.int64)
         byte_bits = (torch.arange(256, dtype=torch.int64).unsqueeze(-1) >> torch.arange(8, dtype=torch.int64)) & 1
         lut_vals[:256] = byte_bits
         # Special tokens bit patterns
         lut_vals[GrayCodeEncoder.START, 0] = 1
         lut_vals[GrayCodeEncoder.EOS, 1] = 1
         # PAD remains all zeros
-        lut_vals[self.register_id, 2] = 1  # REGISTER unique bit
+        lut_vals[GrayCodeEncoder.REGISTER, 2] = 1  # REGISTER unique bit
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
         # Cache for causal masks by (device, seq_len)
         self._causal_masks: dict[tuple[str, int], torch.Tensor] = {}
@@ -503,7 +543,7 @@ class XOR8BitLM(nn.Module):
         self.norm = RMSNorm(d_model)
 
         # Output head (now 260 including REGISTER)
-        self.out = nn.Linear(d_model, 260)
+        self.out = nn.Linear(d_model, len(self.encoder))
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -589,8 +629,8 @@ class XOR8BitLM(nn.Module):
             # Prevent sampling of START, PAD, and REGISTER tokens
             logits[..., self.encoder.START] = -float('inf')
             logits[..., self.encoder.PAD] = -float('inf')
-            if hasattr(self, 'register_id'):
-                logits[..., self.register_id] = -float('inf')
+            if hasattr(self, 'encoder.REGISTER'):
+                logits[..., self.enoder.REGISTER] = -float('inf')
 
             # Check if we have any valid logits
             if not torch.isfinite(logits).any():
@@ -600,8 +640,8 @@ class XOR8BitLM(nn.Module):
                 logits[..., self.encoder.EOS] = 1.0  # Allow EOS
                 logits[..., self.encoder.START] = -float('inf')
                 logits[..., self.encoder.PAD] = -float('inf')
-                if hasattr(self, 'register_id'):
-                    logits[..., self.register_id] = -float('inf')
+                if hasattr(self, 'encoder.REGISTER'):
+                    logits[..., self.encoder.REGISTER] = -float('inf')
                 if debug:
                     print("[gen] fallback logits -> uniform over bytes + EOS; masked START/PAD")
 
@@ -779,7 +819,7 @@ class Trainer:
         self.autocast_ctx = autocast_ctx
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader, max_batches: int = None) -> tuple[float, float]:
+    def evaluate(self, dataloader: DataLoader, max_batches: int = None, use_mutor: bool = True) -> tuple[float, float]:
         """Fast evaluation with mixed precision.
         Returns: (avg_loss, perplexity)
         """
@@ -797,16 +837,10 @@ class Trainer:
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
 
-            # Use same autocast context as training
-            if self.device == 'cuda':
-                autocast_ctx = torch.amp.autocast(device_type='cuda')
-            else:
-                autocast_ctx = contextlib.nullcontext()
-
-            with autocast_ctx:
+            with self.autocast_ctx:
                 logits = self.model(inputs)
                 loss = F.cross_entropy(
-                    logits.reshape(-1, 259),
+                    logits.reshape(-1, logits.size(-1)),
                     targets.reshape(-1),
                     ignore_index=self.model.encoder.PAD,
                     reduction='none'
@@ -940,7 +974,7 @@ def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8
 
     aug_batch = torch.full((B, L2), model.encoder.PAD, device=device, dtype=torch.long)
     aug_batch[:, 0::2] = inputs
-    aug_batch[:, 1::2] = int(model.register_id)
+    aug_batch[:, 1::2] = int(model.encoder.REGISTER)
 
     # Positions for RoPE
     positions = torch.zeros((B, L2), device=device, dtype=torch.long)
@@ -951,7 +985,7 @@ def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8
     reg_pos = torch.clamp(base_pos + (d - 1), max=L - 1)
     positions[:, 1::2] = reg_pos
 
-    is_register = (aug_batch == int(model.register_id))
+    is_register = (aug_batch == int(model.encoder.REGISTER))
 
     # Build augmented targets
     aug_targets = torch.full_like(aug_batch, model.encoder.PAD)
@@ -1301,7 +1335,7 @@ CORIOLANUS:
     print(f"Decoded length: {len(decoded)}")
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
-    test_run = True
+    test_run = False
 
     if test_run:
         model = train(
@@ -1319,16 +1353,16 @@ CORIOLANUS:
         # Train example (uncomment to run)
         model = train(
             "datasets/packed",
-            packed_dirs=["datasets/packed/train"],
-            val_packed_dirs=["datasets/packed/val"],
+            packed_dirs=["datasets/packed/tiny-lessons/train"],
+            val_packed_dirs=["datasets/packed/tiny-lessons/val"],
             seq_length=512,
-            batch_size=8,
+            batch_size=4,
             epochs=5,
             d_model=512,
             n_heads=8,
             n_layers=8,
             rope_base=10000,
-            test_prompt="See "
+            test_prompt="The "
         )
 
     output = model.generate(input_text, max_len=200)
