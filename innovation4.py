@@ -366,6 +366,13 @@ class AsymGQATransformerBlock(nn.Module):
 
         # Create mapping: which KV head does each Q head use?
         self.register_buffer('kv_map', self._create_kv_map())
+        # Group aggregation matrix to map per-Q-head features to per-KV-head features
+        # Shape: [n_kv_heads, n_heads]; rows average features over heads in the group
+        group_agg = torch.zeros(self.n_kv_heads, self.n_heads, dtype=torch.float32)
+        for kv_idx, group in enumerate(self.groups):
+            if len(group) > 0:
+                group_agg[kv_idx, group] = 1.0 / float(len(group))
+        self.register_buffer('group_agg', group_agg)
 
         # Q always full size, K/V based on groups
         self.q_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
@@ -388,6 +395,33 @@ class AsymGQATransformerBlock(nn.Module):
         nn.init.normal_(self.tau_wq, std=0.02)
         nn.init.normal_(self.tau_wv_kv, std=0.02)
         nn.init.zeros_(self.tau_alpha)
+
+        # Small LRU cache for position logs per device and sequence length
+        self._poslog_cache_lru = None
+        self._poslog_cache_max = 64
+
+    def _get_pos_log_cached(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Return cached log1p(arange(L)) [L] float32 on device."""
+        if self._poslog_cache_lru is None:
+            from collections import OrderedDict
+            self._poslog_cache_lru = OrderedDict()
+
+        key = (str(device), int(seq_len))
+        cache = self._poslog_cache_lru
+        if key in cache:
+            val = cache.pop(key)
+            cache[key] = val
+            if val.device != device:
+                val = val.to(device)
+                cache[key] = val
+            return val
+        # Miss → create
+        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        val = torch.log1p(pos)
+        cache[key] = val
+        if len(cache) > self._poslog_cache_max:
+            cache.popitem(last=False)
+        return val
 
     def _create_kv_map(self):
         """Create index mapping from Q heads to KV heads"""
@@ -418,19 +452,22 @@ class AsymGQATransformerBlock(nn.Module):
         v = v[:, self.kv_map]
 
         # Tau computation using already-projected values
+        # Single GELU features from q_proj reused for both q and v tau computations
         tok_feat_q = F.gelu(q_proj).reshape(B, L, self.n_heads, self.head_dim)
-        tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))
-
-        tok_feat_v = F.gelu(v_proj).reshape(B, L, self.n_kv_heads, self.head_dim)
-        tau_tok_v_grouped = torch.tanh((tok_feat_v * self.tau_wv_kv).sum(dim=-1))
-        tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,L,-1))
+        tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))  # [B, L, H]
+        # Map per-Q-head features to per-KV-head features via group aggregation
+        # grouped_tok_feat: [B, L, n_kv_heads, head_dim]
+        grouped_tok_feat = torch.einsum('gh,blhd->blgd', self.group_agg, tok_feat_q)
+        tau_tok_v_grouped = torch.tanh((grouped_tok_feat * self.tau_wv_kv).sum(dim=-1))  # [B, L, n_kv_heads]
+        tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,L,-1))  # [B, L, H]
 
         # Position term (standardized dtype)
         if positions is None:
-            positions = torch.arange(L, device=x.device, dtype=torch.float32).view(1, L).expand(B, L)
+            pos_log_1d = self._get_pos_log_cached(L, x.device)  # [L]
+            pos_log = pos_log_1d.view(1, L).expand(B, L)
         else:
             positions = positions.to(torch.float32)
-        pos_log = torch.log1p(positions)
+            pos_log = torch.log1p(positions)
         alpha = torch.sigmoid(self.tau_alpha)
         tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, L) - 0.5
 
@@ -462,9 +499,7 @@ class AsymGQATransformerBlock(nn.Module):
             scores.masked_fill_(mask_norm, -float('inf'))
         if key_padding_mask is not None:
             # Mask both rows (queries from PAD) and columns (keys that are PAD)
-            key_mask_expanded = key_padding_mask[:, None, None, :]  # [B, 1, 1, L]
-            query_mask_expanded = key_padding_mask[:, None, :, None]  # [B, 1, L, 1]
-            scores.masked_fill_(key_mask_expanded | query_mask_expanded, -float('inf'))
+            scores.masked_fill_(key_padding_mask[:, None, None, :], -float('inf'))
 
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
@@ -500,16 +535,16 @@ class AsymGQATransformerBlock(nn.Module):
 
         tok_feat_q = F.gelu(q_proj).reshape(B, L, self.n_heads, self.head_dim)
         tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))
-
-        tok_feat_v = F.gelu(v_proj).reshape(B, L, self.n_kv_heads, self.head_dim)
-        tau_tok_v_grouped = torch.tanh((tok_feat_v * self.tau_wv_kv).sum(dim=-1))
+        grouped_tok_feat = torch.einsum('gh,blhd->blgd', self.group_agg, tok_feat_q)
+        tau_tok_v_grouped = torch.tanh((grouped_tok_feat * self.tau_wv_kv).sum(dim=-1))
         tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,L,-1))
 
         if positions is None:
-            positions = torch.arange(L, device=x.device, dtype=torch.float32).view(1, L).expand(B, L)
+            pos_log_1d = self._get_pos_log_cached(L, x.device)
+            pos_log = pos_log_1d.view(1, L).expand(B, L)
         else:
             positions = positions.to(torch.float32)
-        pos_log = torch.log1p(positions)
+            pos_log = torch.log1p(positions)
         alpha = torch.sigmoid(self.tau_alpha)
         tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, L) - 0.5
 
@@ -573,12 +608,12 @@ class AsymGQATransformerBlock(nn.Module):
 
         tok_feat_q = F.gelu(q_proj).reshape(B, T, self.n_heads, self.head_dim)
         tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))
-
-        tok_feat_v = F.gelu(v_proj).reshape(B, T, self.n_kv_heads, self.head_dim)
-        tau_tok_v_grouped = torch.tanh((tok_feat_v * self.tau_wv_kv).sum(dim=-1))
+        grouped_tok_feat = torch.einsum('gh,blhd->blgd', self.group_agg, tok_feat_q)
+        tau_tok_v_grouped = torch.tanh((grouped_tok_feat * self.tau_wv_kv).sum(dim=-1))
         tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,T,-1))
 
         positions_last = positions_last.to(torch.float32)
+        # For T==1 we don't need caching; compute directly
         pos_log = torch.log1p(positions_last)
         alpha = torch.sigmoid(self.tau_alpha)
         tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, T) - 0.5
@@ -1512,22 +1547,39 @@ class EntropyMuToRController:
 
     @torch.no_grad()
     def select_registers(self, difficulty: torch.Tensor) -> torch.Tensor:
-        """Select register positions per batch with min spacing. Returns bool mask [B, L]."""
+        """Select register positions per batch with min spacing. Returns bool mask [B, L].
+
+        Vectorized NMS-like selection using 1D max-pooling to enforce min_spacing.
+        """
         B, L = difficulty.shape
         k = max(1, int(self.density_ratio * L))
-        # Candidates by top scores per batch
-        scores, idx = torch.topk(difficulty, k=min(k * 2, L), dim=1, largest=True, sorted=True)
+
+        # Add tiny position-dependent bias to break ties deterministically
+        idx = torch.arange(L, device=difficulty.device, dtype=difficulty.dtype)
+        eps = (idx / max(L - 1, 1)).unsqueeze(0) * 1e-6
+        biased = difficulty + eps
+
+        # Max-pool to identify local maxima with separation >= min_spacing
+        if self.min_spacing <= 1:
+            pooled = biased
+        else:
+            kernel = 2 * self.min_spacing - 1
+            pad = self.min_spacing - 1
+            pooled = F.max_pool1d(biased.unsqueeze(1), kernel_size=kernel, stride=1, padding=pad).squeeze(1)
+
+        candidates = biased == pooled  # [B, L] bool, at most one peak per window after tie-break
+
+        # Select top-k among candidates
+        masked_scores = torch.where(candidates, difficulty, torch.full_like(difficulty, -float('inf')))
+        k_eff = min(k, L)
+        topk_vals, topk_idx = torch.topk(masked_scores, k=k_eff, dim=1, largest=True, sorted=False)
+        valid = torch.isfinite(topk_vals)
+
         mask = torch.zeros(B, L, dtype=torch.bool, device=difficulty.device)
-        for b in range(B):
-            selected = 0
-            last_pos = -self.min_spacing
-            for pos in idx[b].tolist():
-                if pos - last_pos >= self.min_spacing:
-                    mask[b, pos] = True
-                    last_pos = pos
-                    selected += 1
-                    if selected >= k:
-                        break
+        if valid.any():
+            rows = torch.arange(B, device=difficulty.device).unsqueeze(1).expand_as(topk_idx)
+            mask[rows[valid], topk_idx[valid]] = True
+
         return mask
 
     @torch.no_grad()
@@ -1612,7 +1664,7 @@ def compute_mutor_loss(logits, aug_targets, is_register, pad_id, alpha=0.3):
 
     return weighted_loss
 
-def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] = None, checkpoint: bool = False):
+def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] = None, checkpoint: bool = False, epoch: int = 0):
     """Save model and config - updated for RoPE model."""
     path = Path(path)
     path.mkdir(exist_ok=True, parents=True)
@@ -1643,7 +1695,7 @@ def save_model(model: XOR8BitLM, path: Union[str, Path], config: Dict[str, Any] 
 
     # Save weights
     if checkpoint:
-        torch.save(model.state_dict(), path / 'model_checkpoint.pt')
+        torch.save(model.state_dict(), path / f'model_checkpoint_{epoch}.pt')
     else:
         torch.save(model.state_dict(), path / 'model.pt')
 
@@ -1866,7 +1918,7 @@ def train(
                 'rope_base': model.rope.base,
                 'best_perplexity': trainer.metrics.best_perp,
                 'epoch': epoch + 1
-            }, checkpoint=True)
+            }, checkpoint=True, epoch=epoch + 1)
 
         # Generate sample
         model.eval()
@@ -1951,13 +2003,13 @@ CORIOLANUS:
     print(f"Decoded length: {len(decoded)}")
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
-    model = load_model("xor_model", "mps")
+    test_run = False
+    load_and_test = False
 
-    run_test_generations(model, "The world is a cold place.", max_len=512)
-
-    exit()
-
-    test_run = True
+    if load_and_test:
+        model = load_model("xor_model", "mps")
+        run_test_generations(model, "The world is a cold place.", max_len=512)
+        exit()
 
     if test_run:
         model = train(
@@ -1977,8 +2029,8 @@ CORIOLANUS:
             "datasets/packed",
             packed_dirs=["datasets/packed/tiny-lessons/train"],
             val_packed_dirs=["datasets/packed/tiny-lessons/val"],
-            seq_length=512,
-            batch_size=4,
+            seq_length=2048,
+            batch_size=2,
             epochs=5,
             d_model=512,
             n_heads=8,
@@ -1990,14 +2042,14 @@ CORIOLANUS:
     output = model.generate_with_cache(input_text, max_len=200)
     print(f"\nGenerated:\n{output}")
 
-    output = model.generate_with_cache("The world is a cold place.", max_len=512)
-    print(f"\nGenerated: {output}")
 
     output = model.generate_with_cache("Maailm on karm.", max_len=512)
     print(f"\nGenerated: {output}")
 
     output = model.generate_with_cache("Elu on ilus.", max_len=512)
     print(f"\nGenerated: {output}")
+
+    run_test_generations(model, "The world is a cold place.", max_len=512)
 
     # Or train from HuggingFace
     # model = train_from_hf("wikitext", "wikitext-2-raw-v1", epochs=5)
