@@ -1858,7 +1858,7 @@ def train(
             workers = min(8, (os.cpu_count() or 8))
             return dict(num_workers=workers, pin_memory=True, persistent_workers=True, prefetch_factor=4, shuffle=not for_eval)
         elif device == 'mps':
-            return dict(num_workers=2, pin_memory=False, persistent_workers=True, prefetch_factor=2, shuffle=not for_eval)
+            return dict(num_workers=0, pin_memory=False, persistent_workers=False, prefetch_factor=None, shuffle=not for_eval)
         else:
             workers = min(4, (os.cpu_count() or 4))
             return dict(num_workers=workers, pin_memory=False, persistent_workers=True, prefetch_factor=2, shuffle=not for_eval)
@@ -2187,7 +2187,7 @@ CORIOLANUS:
                         'datasets/packed/orca-pre',
                         'datasets/packed/tiny-lessons',
                         'datasets/packed/tiny-textbooks',
-                        #'datasets/packed/tiny-superwiki'
+                        'datasets/packed/tiny-superwiki'
                     ],
                     'epochs': 1,
                     'lr': 3e-4

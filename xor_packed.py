@@ -29,18 +29,53 @@ class PackedXORShardDataset(Dataset):
         self.pad_id = int(pad_id)
         self.device = device
 
-        # Load metadata and maps
-        self.tokens = np.memmap(self.shard_dir / 'tokens.mmap', dtype='uint16', mode='r')
-        self.offsets = np.load(self.shard_dir / 'offsets.npy', mmap_mode='r')
-        self.lengths = np.load(self.shard_dir / 'lengths.npy', mmap_mode='r')
-        # Optional loss mask
-        loss_mask_path = self.shard_dir / 'loss_mask.mmap'
-        self.loss_mask = None
-        if loss_mask_path.exists():
-            self.loss_mask = np.memmap(loss_mask_path, dtype='uint8', mode='r')
+        # Store paths and lazy-open memmaps to minimize open FDs
+        self._tokens_path = self.shard_dir / 'tokens.mmap'
+        self._loss_mask_path = self.shard_dir / 'loss_mask.mmap'
+        self.tokens: Optional[np.memmap] = None
+        self.loss_mask: Optional[np.memmap] = None
+
+        # Load small index arrays fully into RAM to avoid mmap FDs
+        self.offsets = np.asarray(np.load(self.shard_dir / 'offsets.npy'))
+        self.lengths = np.asarray(np.load(self.shard_dir / 'lengths.npy'))
 
         # Build window index: global -> (doc_id, start)
         self._build_window_index()
+
+    def _ensure_open(self):
+        """Lazily open memmaps for tokens and optional loss mask."""
+        if self.tokens is None:
+            self.tokens = np.memmap(self._tokens_path, dtype='uint16', mode='r')
+        if self.loss_mask is None and self._loss_mask_path.exists():
+            self.loss_mask = np.memmap(self._loss_mask_path, dtype='uint8', mode='r')
+
+    def _close_memmaps(self):
+        """Best-effort close of underlying mmap objects to release FDs."""
+        try:
+            if isinstance(self.tokens, np.memmap) and getattr(self.tokens, "_mmap", None) is not None:
+                self.tokens._mmap.close()
+        except Exception:
+            pass
+        finally:
+            self.tokens = None
+        try:
+            if isinstance(self.loss_mask, np.memmap) and getattr(self.loss_mask, "_mmap", None) is not None:
+                self.loss_mask._mmap.close()
+        except Exception:
+            pass
+        finally:
+            self.loss_mask = None
+
+    def __del__(self):
+        # Ensure file descriptors are released promptly
+        self._close_memmaps()
+
+    def __getstate__(self):
+        # Avoid pickling open memmaps; workers will lazy-open after spawn
+        state = self.__dict__.copy()
+        state['tokens'] = None
+        state['loss_mask'] = None
+        return state
 
     def _build_window_index(self):
         seq_len = self.seq_length
@@ -78,6 +113,8 @@ class PackedXORShardDataset(Dataset):
         return int(self.window_doc_ids.shape[0])
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        # Lazy-open memmaps on first access
+        self._ensure_open()
         doc_id = int(self.window_doc_ids[idx])
         start = int(self.window_starts[idx])
         offset = int(self.offsets[doc_id])
@@ -363,7 +400,8 @@ def _estimate_windows_for_lengths(lengths: np.ndarray, seq_length: int, stride: 
 
 
 def _shard_window_count(shard_dir: str | Path, seq_length: int, stride: int) -> int:
-    lengths = np.load(Path(shard_dir) / 'lengths.npy', mmap_mode='r')
+    # Load into RAM to avoid holding a memmap FD during selection
+    lengths = np.asarray(np.load(Path(shard_dir) / 'lengths.npy'))
     return _estimate_windows_for_lengths(lengths, seq_length, stride)
 
 
