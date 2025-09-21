@@ -20,6 +20,7 @@ from xor_packed import PackedXORShardDataset, MixedPackedXORDataset, discover_sh
 from xor_packed import ensure_train_val_split, build_mixed_dataset
 from xor_packed import build_capped_mixed_dataset
 import os
+import wandb
 
 torch.set_float32_matmul_precision('high')
 
@@ -1824,6 +1825,31 @@ def train(
 ):
     """Complete training pipeline."""
 
+    run = wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="energyx-hologram",
+        # Set the wandb project where this run will be logged.
+        project="kulles",
+        # Track hyperparameters and run metadata.
+        config={
+            "learning_rate": lr,
+            "architecture": "XOR8BitLM",
+            "epochs": epochs,
+            "d_model": d_model,
+            "n_heads": n_heads,
+            "n_layers": n_layers,
+            "batch_size": batch_size,
+            "seq_length": seq_length,
+            "rope_base": rope_base,
+            "mutor_mode": mutor_mode,
+            "mutor_density_ratio": mutor_density_ratio,
+            "mutor_min_spacing": mutor_min_spacing,
+            "mutor_update_every": mutor_update_every,
+            "mutor_buffer_momentum": mutor_buffer_momentum,
+            "mutor_bit_divergence_weight": mutor_bit_divergence_weight,
+        },
+    )
+
     print(f"Training on {device}")
 
     # Helper to build device-tuned DataLoader args
@@ -1975,6 +2001,13 @@ def train(
                     'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
                     'grok': f"{trainer.metrics.get_signal():.3f}"
                 })
+                run.log({
+                    'train/loss': loss,
+                    'train/ema': trainer.metrics.train_loss_ema,
+                    'validation/ema': trainer.metrics.eval_loss_ema,
+                    'perplexity/ema': trainer.metrics.perp_ema,
+                    'grok': trainer.metrics.get_signal()
+                })
                 if stage_steps is not None and global_step >= int(stage_steps):
                     print(f"[stage] {stage_name}: reached step cap ({global_step}/{int(stage_steps)}); ending stage after summary.")
                     reached_cap = True
@@ -1996,6 +2029,11 @@ def train(
                       f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
                 print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
                 print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
+                run.log({
+                    'validation/loss': avg_eval_loss,
+                    'validation/perplexity': epoch_perplexity,
+                    'validation/grok': trainer.metrics.get_signal()
+                })
 
             # Save checkpoint per epoch
             save_model(model, model_path, {
@@ -2073,6 +2111,8 @@ def train(
         # Single-stage legacy flow
         _run_stage('main', train_loader, val_loader, epochs, lr)
 
+    run.finish()
+
     save_model(model, model_path)
     return model
 
@@ -2147,7 +2187,7 @@ CORIOLANUS:
                         'datasets/packed/orca-pre',
                         'datasets/packed/tiny-lessons',
                         'datasets/packed/tiny-textbooks',
-                        'datasets/packed/tiny-superwiki'
+                        #'datasets/packed/tiny-superwiki'
                     ],
                     'epochs': 1,
                     'lr': 3e-4
