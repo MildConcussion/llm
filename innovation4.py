@@ -17,6 +17,8 @@ import contextlib
 from tqdm import tqdm
 from grokadamw import GrokAdamW
 from xor_packed import PackedXORShardDataset, MixedPackedXORDataset, discover_shards
+from xor_packed import ensure_train_val_split, build_mixed_dataset
+from xor_packed import build_capped_mixed_dataset
 import os
 
 torch.set_float32_matmul_precision('high')
@@ -181,6 +183,8 @@ class GrayCodeEncoder:
     """Gray code preserves bit locality."""
 
     START, EOS, PAD, REGISTER = 256, 257, 258, 259
+    # New special tokens for instruction message boundaries
+    IM_START, IM_END = 260, 261
 
     def __init__(self):
         # Precompute Gray code lookup
@@ -208,7 +212,8 @@ class GrayCodeEncoder:
         return bytes(original.astype(np.uint8)).decode('utf-8', errors='ignore')
 
     def __len__(self):
-        return len(self.gray_lut) + 4
+        # bytes (0..255) + START/EOS/PAD/REGISTER/IM_START/IM_END
+        return len(self.gray_lut) + 6
 
 
 # ============= DATASET =============
@@ -671,6 +676,9 @@ class XOR8BitLM(nn.Module):
         lut_vals[GrayCodeEncoder.EOS, 1] = 1
         # PAD remains all zeros
         lut_vals[GrayCodeEncoder.REGISTER, 2] = 1  # REGISTER unique bit
+        # Instruction message boundary tokens
+        lut_vals[GrayCodeEncoder.IM_START, 3] = 1
+        lut_vals[GrayCodeEncoder.IM_END, 4] = 1
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
         # Cache for causal masks by (device, seq_len)
         self._causal_masks: dict[tuple[str, int], torch.Tensor] = {}
@@ -951,6 +959,11 @@ class XOR8BitLM(nn.Module):
             last_logits[..., self.encoder.START] = -float('inf')
             last_logits[..., self.encoder.PAD] = -float('inf')
             last_logits[..., self.encoder.REGISTER] = -float('inf')
+            # Avoid sampling instruction boundary tokens during free generation
+            if hasattr(self.encoder, 'IM_START'):
+                last_logits[..., self.encoder.IM_START] = -float('inf')
+            if hasattr(self.encoder, 'IM_END'):
+                last_logits[..., self.encoder.IM_END] = -float('inf')
 
             if not torch.isfinite(last_logits).any():
                 last_logits = torch.zeros_like(last_logits)
@@ -1047,6 +1060,11 @@ class XOR8BitLM(nn.Module):
             logits[..., self.encoder.START] = -float('inf')
             logits[..., self.encoder.PAD] = -float('inf')
             logits[..., self.encoder.REGISTER] = -float('inf')
+            # Avoid sampling instruction boundary tokens during free generation
+            if hasattr(self.encoder, 'IM_START'):
+                logits[..., self.encoder.IM_START] = -float('inf')
+            if hasattr(self.encoder, 'IM_END'):
+                logits[..., self.encoder.IM_END] = -float('inf')
 
             # Check if we have any valid logits
             if not torch.isfinite(logits).any():
@@ -1316,7 +1334,14 @@ class Trainer:
 
     def train_step(self, batch: torch.Tensor, use_mutor: bool = True) -> float:
         """Single training step with mixed precision and optional MuToR."""
-        batch = batch.to(self.device)
+        # Support optional (tokens, loss_mask) from packed dataset v2
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            tokens, loss_mask = batch
+            batch = tokens.to(self.device)
+            loss_mask = loss_mask.to(self.device)
+        else:
+            batch = batch.to(self.device)
+            loss_mask = None
 
         # Prepare inputs and targets
         inputs = batch[:, :-1]
@@ -1374,7 +1399,7 @@ class Trainer:
                 weights = torch.full((B, L), 1.0 - self.model.mutor_alpha, device=self.device, dtype=logits.dtype)
                 weights[reg_valid] = self.model.mutor_alpha
 
-                # Compute weighted CE loss over valid positions
+                # Compute weighted CE loss over valid positions, with optional dataset loss mask
                 per_pos_loss = F.cross_entropy(
                     logits.reshape(B * L, V),
                     combined_targets.reshape(B * L),
@@ -1382,7 +1407,22 @@ class Trainer:
                     reduction='none'
                 ).view(B, L)
 
-                valid_mask = combined_targets != pad_id
+                base_valid = combined_targets != pad_id
+                if loss_mask is not None:
+                    # Build target-aligned mask per position
+                    lm = (loss_mask > 0.5)
+                    idx = torch.arange(L, device=self.device).view(1, -1)
+                    idx_b = idx.expand(B, -1)
+                    non_reg_target_idx = (idx_b + 1).clamp(max=L - 1)
+                    gathered_nonreg = lm.gather(1, non_reg_target_idx)
+                    gathered_reg = lm.gather(1, target_pos.clamp(max=batch_len - 1))
+                    target_mask = torch.zeros(B, L, dtype=torch.bool, device=self.device)
+                    target_mask[non_reg_mask] = gathered_nonreg[non_reg_mask]
+                    target_mask[reg_valid] = gathered_reg[reg_valid]
+                    valid_mask = base_valid & target_mask
+                else:
+                    valid_mask = base_valid
+
                 if valid_mask.any():
                     loss = (per_pos_loss[valid_mask] * weights[valid_mask]).mean()
                 else:
@@ -1398,11 +1438,32 @@ class Trainer:
                     print(f"[mutor-sparse] regs={num_regs} ({num_regs/(B*L+1e-6):.3f}), offsets∈[1..{self.model.mutor_dmax}], valid={reg_valid.sum().item()}")
             else:
                 logits = self.model(inputs)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets.reshape(-1),
-                    ignore_index=self.encoder.PAD
-                )
+                if loss_mask is not None:
+                    # Use target-aligned mask: positions predict next token
+                    mask = loss_mask[:, 1:]
+                    per_pos_loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets.reshape(-1),
+                        ignore_index=self.encoder.PAD,
+                        reduction='none'
+                    ).view_as(mask)
+                    # Count only masked, non-PAD
+                    valid = (targets != self.encoder.PAD) & (mask > 0.5)
+                    if valid.any():
+                        loss = (per_pos_loss[valid]).mean()
+                    else:
+                        # Fallback to standard loss if no masked targets present
+                        loss = F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)),
+                            targets.reshape(-1),
+                            ignore_index=self.encoder.PAD
+                        )
+                else:
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets.reshape(-1),
+                        ignore_index=self.encoder.PAD
+                    )
 
             # Scale for gradient accumulation
             loss = loss / self.grad_accum_steps
@@ -1437,7 +1498,13 @@ class Trainer:
     @torch.no_grad()
     def eval_step(self, batch: torch.Tensor) -> tuple[float, int]:
         """Single evaluation step - returns loss and valid token count."""
-        batch = batch.to(self.device)
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            tokens, loss_mask = batch
+            batch = tokens.to(self.device)
+            loss_mask = loss_mask.to(self.device)
+        else:
+            batch = batch.to(self.device)
+            loss_mask = None
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
 
@@ -1451,6 +1518,10 @@ class Trainer:
             )
 
             valid_mask = targets.reshape(-1) != self.encoder.PAD
+            if loss_mask is not None:
+                # Align to targets (next token)
+                m = loss_mask[:, 1:].reshape(-1) > 0.5
+                valid_mask = valid_mask & m
             valid_loss = loss[valid_mask]
 
             if valid_loss.numel() > 0:
@@ -1748,6 +1819,8 @@ def train(
     mutor_update_every: int = 5,
     mutor_buffer_momentum: float = 0.95,
     mutor_bit_divergence_weight: float = 0.3,
+    # Curriculum settings (optional): list of stages [{'name': 'pretrain', 'packed_dirs': [...], 'epochs': 1, 'lr': 3e-4}, ...]
+    curriculum: Optional[List[Dict[str, Any]]] = None,
 ):
     """Complete training pipeline."""
 
@@ -1789,127 +1862,124 @@ def train(
 
         return MixedPackedXORDataset(ds_per_root, policy=mixing_policy, weights=mixing_weights)
 
-    use_packed = False
-    train_dataset = None
-    val_dataset = None
+    using_curriculum = bool(curriculum and len(curriculum) > 0)
 
-    if packed_dirs is not None and len(packed_dirs) > 0:
-        train_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
-        use_packed = True
-        print(f"Using packed datasets for training. policy={mixing_policy}, weights={mixing_weights}")
-    else:
-        # Auto-detect packed shards under data_path directory
-        dp = Path(data_path)
-        if dp.is_dir():
-            shard_dirs = discover_shards(str(dp))
-            if shard_dirs:
-                train_dataset = _build_packed_dataset([dp])
-                use_packed = True
-                print(f"Auto-detected packed shards under {dp}")
+    if not using_curriculum:
+        use_packed = False
+        train_dataset = None
+        val_dataset = None
 
-    if train_dataset is None:
-        # Fallback to simple text dataset
-        train_dataset = XORDataset(data_path, seq_length)
-
-    train_loader = DataLoader(train_dataset, batch_size, **_loader_kwargs(for_eval=False))
-
-    # Validation dataset
-    if val_packed_dirs is not None and len(val_packed_dirs) > 0:
-        val_dataset = _build_packed_dataset([str(p) for p in val_packed_dirs])
-    elif val_path is not None:
-        vp = Path(val_path)
-        if vp.is_dir() and discover_shards(str(vp)):
-            val_dataset = _build_packed_dataset([vp])
+        if packed_dirs is not None and len(packed_dirs) > 0:
+            train_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
+            use_packed = True
+            print(f"Using packed datasets for training. policy={mixing_policy}, weights={mixing_weights}")
         else:
-            val_dataset = XORDataset(val_path, seq_length)
-    else:
-        if use_packed:
-            # Heuristic: reuse train roots for eval with full-stride windows (no shuffle in loader)
-            if packed_dirs is not None and len(packed_dirs) > 0:
-                val_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
+            # Auto-detect packed shards under data_path directory
+            dp = Path(data_path)
+            if dp.is_dir():
+                shard_dirs = discover_shards(str(dp))
+                if shard_dirs:
+                    train_dataset = _build_packed_dataset([dp])
+                    use_packed = True
+                    print(f"Auto-detected packed shards under {dp}")
+
+        if train_dataset is None:
+            # Fallback to simple text dataset
+            train_dataset = XORDataset(data_path, seq_length)
+
+        train_loader = DataLoader(train_dataset, batch_size, **_loader_kwargs(for_eval=False))
+
+        # Validation dataset
+        if val_packed_dirs is not None and len(val_packed_dirs) > 0:
+            val_dataset = _build_packed_dataset([str(p) for p in val_packed_dirs])
+        elif val_path is not None:
+            vp = Path(val_path)
+            if vp.is_dir() and discover_shards(str(vp)):
+                val_dataset = _build_packed_dataset([vp])
             else:
-                val_dataset = _build_packed_dataset([dp])
+                val_dataset = XORDataset(val_path, seq_length)
         else:
-            # Use 10% of training data with different stride for pseudo-validation
-            val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
+            if use_packed:
+                # Heuristic: reuse train roots for eval with full-stride windows (no shuffle in loader)
+                if packed_dirs is not None and len(packed_dirs) > 0:
+                    val_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
+                else:
+                    val_dataset = _build_packed_dataset([dp])
+            else:
+                # Use 10% of training data with different stride for pseudo-validation
+                val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
 
-    val_loader = DataLoader(val_dataset, batch_size, **_loader_kwargs(for_eval=True))
+        val_loader = DataLoader(val_dataset, batch_size, **_loader_kwargs(for_eval=True))
 
-    # Create model
+    # Create model once and reuse across stages
     model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base, mutor_dmax=3)
 
     # Compile for speed (PyTorch 2.0+)
     if compile_model and hasattr(torch, 'compile'):
         model = torch.compile(model)
 
-    # Create trainer with correct OneCycle total steps
-    steps_per_epoch = max(len(train_loader), 1)
-    total_steps = steps_per_epoch * epochs
-    trainer = Trainer(
-        model,
-        lr=lr,
-        device=device,
-        total_steps=total_steps,
-        warmup_steps=min(1000, total_steps // 10),
-        ema_alpha=ema_alpha,
-        mutor_mode=mutor_mode,
-        mutor_density_ratio=mutor_density_ratio,
-        mutor_min_spacing=mutor_min_spacing,
-        mutor_update_every=mutor_update_every,
-        mutor_buffer_momentum=mutor_buffer_momentum,
-        mutor_bit_divergence_weight=mutor_bit_divergence_weight,
-    )
+    def _run_stage(stage_name: str, stage_train_loader, stage_val_loader, stage_epochs: int, stage_lr: float, stage_steps: Optional[int] = None):
+        steps_per_epoch = max(len(stage_train_loader), 1)
+        planned_total = steps_per_epoch * stage_epochs
+        effective_total = planned_total if stage_steps is None else min(planned_total, int(stage_steps))
+        print(f"[stage] {stage_name}: steps_per_epoch={steps_per_epoch}, planned_total={planned_total}, effective_total={effective_total}")
+        trainer = Trainer(
+            model,
+            lr=stage_lr,
+            device=device,
+            total_steps=effective_total,
+            warmup_steps=min(1000, effective_total // 10),
+            ema_alpha=ema_alpha,
+            mutor_mode=mutor_mode,
+            mutor_density_ratio=mutor_density_ratio,
+            mutor_min_spacing=mutor_min_spacing,
+            mutor_update_every=mutor_update_every,
+            mutor_buffer_momentum=mutor_buffer_momentum,
+            mutor_bit_divergence_weight=mutor_bit_divergence_weight,
+        )
 
-    val_iter = itertools.cycle(val_loader)
+        val_iter = itertools.cycle(stage_val_loader)
+        global_step = 0
+        reached_cap = False
+        for epoch in range(stage_epochs):
+            model.train()
+            pbar = tqdm(stage_train_loader, desc=f"{stage_name} Epoch {epoch+1}/{stage_epochs}")
+            for batch_idx, train_batch in enumerate(pbar):
+                loss = trainer.train_step(train_batch)
+                global_step += 1
+                if global_step % eval_interval == 0:
+                    val_batch = next(val_iter)
+                    trainer.quick_eval_update(val_batch)
+                pbar.set_postfix({
+                    'loss': f"{loss:.4f}",
+                    'train_ema': f"{trainer.metrics.train_loss_ema:.4f}" if trainer.metrics.train_loss_ema else "N/A",
+                    'eval_ema': f"{trainer.metrics.eval_loss_ema:.4f}" if trainer.metrics.eval_loss_ema else "N/A",
+                    'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
+                    'grok': f"{trainer.metrics.get_signal():.3f}"
+                })
+                if stage_steps is not None and global_step >= int(stage_steps):
+                    print(f"[stage] {stage_name}: reached step cap ({global_step}/{int(stage_steps)}); ending stage after summary.")
+                    reached_cap = True
+                    break
 
-    # Training loop with evaluation
-    global_step = 0
+            # Quick full eval snapshot
+            model.eval()
+            eval_losses = []
+            for i, batch in enumerate(itertools.islice(stage_val_loader, 100)):
+                loss, n_tokens = trainer.eval_step(batch)
+                if n_tokens > 0:
+                    eval_losses.append(loss)
+            if eval_losses:
+                avg_eval_loss = np.mean(eval_losses)
+                epoch_perplexity = math.exp(min(avg_eval_loss, 20))
+                print(f"\n{stage_name} Epoch {epoch+1} Summary:")
+                print(f"  Streaming - Train EMA: {trainer.metrics.train_loss_ema:.4f}, "
+                      f"Eval EMA: {trainer.metrics.eval_loss_ema:.4f}, "
+                      f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
+                print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
+                print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
 
-    # Training loop
-    for epoch in range(epochs):
-        model.train()
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for batch_idx, train_batch in enumerate(pbar):
-            # Training step (automatically updates streaming train loss)
-            loss = trainer.train_step(train_batch)
-            global_step += 1
-
-            # Streaming evaluation update
-            if global_step % eval_interval == 0:
-                val_batch = next(val_iter)
-                trainer.quick_eval_update(val_batch)
-
-            # Update progress bar with streaming metrics
-            pbar.set_postfix({
-                'loss': f"{loss:.4f}",
-                'train_ema': f"{trainer.metrics.train_loss_ema:.4f}" if trainer.metrics.train_loss_ema else "N/A",
-                'eval_ema': f"{trainer.metrics.eval_loss_ema:.4f}" if trainer.metrics.eval_loss_ema else "N/A",
-                'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
-                'grok': f"{trainer.metrics.get_signal():.3f}"
-            })
-
-        # Full evaluation at epoch end (optional, for logging)
-        model.eval()
-        eval_losses = []
-        for i, batch in enumerate(itertools.islice(val_loader, 100)):  # Sample 100 batches
-            loss, n_tokens = trainer.eval_step(batch)
-            if n_tokens > 0:
-                eval_losses.append(loss)
-
-        if eval_losses:
-            avg_eval_loss = np.mean(eval_losses)
-            epoch_perplexity = math.exp(min(avg_eval_loss, 20))
-
-            print(f"\nEpoch {epoch+1} Summary:")
-            print(f"  Streaming - Train EMA: {trainer.metrics.train_loss_ema:.4f}, "
-                  f"Eval EMA: {trainer.metrics.eval_loss_ema:.4f}, "
-                  f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
-            print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
-            print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
-
-        # Save checkpoint
-        if (epoch + 1) % 1 == 0:
+            # Save checkpoint per epoch
             save_model(model, model_path, {
                 'd_model': model.d_model,
                 'n_heads': model.n_heads,
@@ -1917,42 +1987,77 @@ def train(
                 'max_len': model.rope.max_seq_len,
                 'rope_base': model.rope.base,
                 'best_perplexity': trainer.metrics.best_perp,
+                'stage': stage_name,
                 'epoch': epoch + 1
             }, checkpoint=True, epoch=epoch + 1)
 
-        # Generate sample
-        model.eval()
-        sample = model.generate(test_prompt, max_len=60)
-        print(f"\nSample: {sample}\n")
+            model.eval()
+            sample = model.generate(test_prompt, max_len=60)
+            print(f"\nSample ({stage_name}): {sample}\n")
+            if reached_cap:
+                break
 
-    # Final save
+    if using_curriculum:
+        # Run staged training with automatic split and mixing per dataset root
+        for stage in curriculum:
+            stage_name = stage.get('name', 'stage')
+            stage_epochs = int(stage.get('epochs', 1))
+            stage_lr = float(stage.get('lr', lr))
+            stage_steps = stage.get('steps', None)
+            if stage_steps is not None:
+                stage_steps = int(stage_steps)
+                if stage_steps <= 0:
+                    raise ValueError(f"Curriculum stage '{stage_name}' has invalid steps={stage_steps}; must be > 0")
+                print(f"[stage] {stage_name}: limiting to {stage_steps} steps")
+            # Accept either 'packed_roots' (preferred) or legacy 'packed_dirs'
+            roots = stage.get('packed_roots') or stage.get('packed_dirs') or []
+            roots = [str(p) for p in roots]
+            if not roots:
+                raise ValueError(f"Curriculum stage '{stage_name}' requires 'packed_roots' or 'packed_dirs'")
+
+            # Ensure train/val split exists (create if missing) for each dataset root
+            val_ratio = float(stage.get('val_ratio', 0.05))
+            split_pairs = []
+            for r in roots:
+                tr_dir, va_dir = ensure_train_val_split(r, val_ratio=val_ratio, seed=42)
+                split_pairs.append((tr_dir, va_dir))
+
+            # Build mixed datasets across all roots for this stage
+            if stage_steps is not None:
+                # Estimate windows needed for training and small validation
+                # Each step consumes one batch; each batch uses `batch_size` windows
+                train_windows_needed = int(stage_steps) * int(batch_size)
+                # For validation: approximate 100 batches like quick eval upper bound
+                val_batches = 100
+                val_windows_needed = val_batches * int(batch_size)
+                print(f"[stage] {stage_name}: capping dataset selection -> train_windows~{train_windows_needed}, val_windows~{val_windows_needed}")
+                stage_train_ds = build_capped_mixed_dataset(
+                    roots, split='train', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                    windows_needed=train_windows_needed, policy=mixing_policy, weights=mixing_weights
+                )
+                stage_val_ds = build_capped_mixed_dataset(
+                    roots, split='val', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                    windows_needed=val_windows_needed, policy=mixing_policy, weights=mixing_weights
+                )
+            else:
+                stage_train_ds = build_mixed_dataset(roots, split='train', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                                                     policy=mixing_policy, weights=mixing_weights)
+                stage_val_ds = build_mixed_dataset(roots, split='val', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                                                   policy=mixing_policy, weights=mixing_weights)
+
+            # Debug counts for visibility
+            print(f"[stage] {stage_name}: roots={len(roots)}; building DataLoaders")
+
+            stage_train_loader = DataLoader(stage_train_ds, batch_size, **_loader_kwargs(for_eval=False))
+            stage_val_loader = DataLoader(stage_val_ds, batch_size, **_loader_kwargs(for_eval=True))
+            _run_stage(stage_name, stage_train_loader, stage_val_loader, stage_epochs, stage_lr, stage_steps=stage_steps)
+    else:
+        # Single-stage legacy flow
+        _run_stage('main', train_loader, val_loader, epochs, lr)
+
     save_model(model, model_path)
     return model
 
-# ============= HF DATASET SUPPORT =============
-
-def train_from_hf(dataset_name: str, **kwargs):
-    """Train from HuggingFace dataset."""
-    from datasets import load_dataset
-    import tempfile
-
-    # Load dataset
-    ds = load_dataset(dataset_name, split='train')
-
-    # Extract text and save to temp file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-        for item in tqdm(ds, desc="Processing dataset"):
-            # Adjust field name as needed (text, content, etc.)
-            text = item.get('text', item.get('content', str(item)))
-            f.write(text + '\n')
-        temp_path = f.name
-
-    # Train
-    model = train(temp_path, **kwargs)
-
-    # Cleanup
-    Path(temp_path).unlink()
-    return model
 
 def run_test_generations(model: XOR8BitLM, input_text: str, max_len: int = 512):
     model.eval()
@@ -1969,39 +2074,6 @@ def run_test_generations(model: XOR8BitLM, input_text: str, max_len: int = 512):
 # ============= EXAMPLE USAGE =============
 
 if __name__ == "__main__":
-    # Quick test
-    print("Testing XOR8Bit Language Model")
-    print("="*60)
-
-    # Test encoder
-    enc = GrayCodeEncoder()
-    text = "Hello World!"
-    encoded = enc.encode(text)
-    decoded = enc.decode(encoded)
-    print(f"Original: {text}")
-    print(f"Encoded: {encoded[:10]}...")
-    print(f"Decoded: {decoded}")
-    print(f"Match: {'✓' if text == decoded else '✗'}")
-
-    input_text = """
-ALL:
-Content, content.
-
-MENENIUS:
-O sir, you are not right: have you not known
-The worthiest men have done't?
-
-CORIOLANUS:
-""".strip()
-
-    encoded = enc.encode(input_text)
-    decoded = enc.decode(encoded)
-    print(f"Original: {input_text}")
-    print(f"Encoded: {encoded}")
-    print(f"Encoded length: {len(encoded)}")
-    print(f"Decoded: {decoded}")
-    print(f"Decoded length: {len(decoded)}")
-    print(f"Match: {'✓' if input_text == decoded else '✗'}")
 
     test_run = False
     load_and_test = False
@@ -2012,6 +2084,17 @@ CORIOLANUS:
         exit()
 
     if test_run:
+        input_text = """
+ALL:
+Content, content.
+
+MENENIUS:
+O sir, you are not right: have you not known
+The worthiest men have done't?
+
+CORIOLANUS:
+""".strip()
+
         model = train(
             "data/tiny_shakespeare.txt",
             seq_length=512,
@@ -2023,12 +2106,14 @@ CORIOLANUS:
             rope_base=10000,
             test_prompt="The "
         )
+
+        output = model.generate_with_cache(input_text, max_len=200)
+        print(f"\nGenerated:\n{output}")
     else:
+
         # Train example (uncomment to run)
         model = train(
             "datasets/packed",
-            packed_dirs=["datasets/packed/tiny-lessons/train"],
-            val_packed_dirs=["datasets/packed/tiny-lessons/val"],
             seq_length=2048,
             batch_size=2,
             epochs=5,
@@ -2036,12 +2121,28 @@ CORIOLANUS:
             n_heads=8,
             n_layers=8,
             rope_base=10000,
-            test_prompt="The "
+            test_prompt="The ",
+            curriculum=[
+                {
+                    'name': 'pretrain',
+                    'packed_roots': [
+                        'datasets/packed/orca-pre',
+                        'datasets/packed/tiny-lessons'
+                    ],
+                    'epochs': 1,
+                    'lr': 3e-4
+                },
+                {
+                    'name': 'school',
+                    'packed_roots': [
+                        'datasets/packed/orca-inst',
+                    ],
+
+                    'steps': 100,
+                    'lr': 2e-4
+                }
+            ]
         )
-
-    output = model.generate_with_cache(input_text, max_len=200)
-    print(f"\nGenerated:\n{output}")
-
 
     output = model.generate_with_cache("Maailm on karm.", max_len=512)
     print(f"\nGenerated: {output}")
