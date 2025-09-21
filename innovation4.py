@@ -19,6 +19,7 @@ from grokadamw import GrokAdamW
 from xor_packed import PackedXORShardDataset, MixedPackedXORDataset, discover_shards
 from xor_packed import ensure_train_val_split, build_mixed_dataset
 from xor_packed import build_capped_mixed_dataset
+
 import os
 import wandb
 
@@ -212,6 +213,27 @@ class GrayCodeEncoder:
         original = self.gray_inv[gray_bytes]
         return bytes(original.astype(np.uint8)).decode('utf-8', errors='ignore')
 
+    def _encode_qwen_message(self, role: str, content: str) -> np.ndarray:
+        """Encode one Qwen-style message segment with IM_START/IM_END and role+content.
+        Layout:
+        [IM_START] + role + "\n" + content + [IM_END] + "\n"
+        Roles are included as raw utf-8 bytes.
+        """
+        role_bytes = (role + "\n").encode('utf-8', errors='ignore')
+        content_bytes = (content or "").encode('utf-8', errors='ignore')
+
+        parts: List[np.ndarray] = []
+        parts.append(np.array([self.IM_START], dtype=np.uint16))
+        if role_bytes:
+            rb = np.frombuffer(role_bytes, dtype=np.uint8)
+            parts.append(self.gray_lut[rb].astype(np.uint16, copy=False))
+        if content_bytes is not None:
+            parts.append(self.gray_lut[np.frombuffer(content_bytes, dtype=np.uint8)].astype(np.uint16, copy=False))
+        parts.append(np.array([self.IM_END], dtype=np.uint16))
+        # trailing newline after IM_END
+        parts.append(self.gray_lut[np.frombuffer(b"\n", dtype=np.uint8)].astype(np.uint16, copy=False))
+        return np.concatenate(parts)
+
     def __len__(self):
         # bytes (0..255) + START/EOS/PAD/REGISTER/IM_START/IM_END
         return len(self.gray_lut) + 6
@@ -261,6 +283,19 @@ class XORDataset(Dataset):
 
 # ============= MODEL =============
 
+@torch.jit.script
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+@torch.jit.script
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
+                         cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE) - Fixed version"""
 
@@ -287,11 +322,6 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer('cos_cached', emb.cos()[None, None, :, :])
         self.register_buffer('sin_cached', emb.sin()[None, None, :, :])
 
-    def rotate_half(self, x):
-        """Rotate half the hidden dims of the input."""
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
     def forward(self, q, k, seq_len=None, positions: torch.Tensor | None = None):
         """Apply rotary embeddings to queries and keys.
         Input shape: [B, H, L, head_dim]
@@ -313,10 +343,7 @@ class RotaryEmbedding(nn.Module):
             sin = emb.sin().unsqueeze(1)  # [B, 1, L, dim]
 
         # Apply rotation using complex number properties
-        q_embed = (q * cos) + (self.rotate_half(q) * sin)
-        k_embed = (k * cos) + (self.rotate_half(k) * sin)
-
-        return q_embed, k_embed
+        return apply_rotary_pos_emb(q, k, cos, sin)
 
 class RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6, bias=False):
@@ -374,7 +401,8 @@ class AsymGQATransformerBlock(nn.Module):
         self.register_buffer('kv_map', self._create_kv_map())
         # Group aggregation matrix to map per-Q-head features to per-KV-head features
         # Shape: [n_kv_heads, n_heads]; rows average features over heads in the group
-        group_agg = torch.zeros(self.n_kv_heads, self.n_heads, dtype=torch.float32)
+        # Match buffer dtype to parameter dtype to avoid casts in einsum
+        group_agg = torch.zeros(self.n_kv_heads, self.n_heads, dtype=dtype)
         for kv_idx, group in enumerate(self.groups):
             if len(group) > 0:
                 group_agg[kv_idx, group] = 1.0 / float(len(group))
@@ -405,6 +433,21 @@ class AsymGQATransformerBlock(nn.Module):
         # Small LRU cache for position logs per device and sequence length
         self._poslog_cache_lru = None
         self._poslog_cache_max = 64
+        self._pos_log_cache = {}
+        self._alpha_sigmoid_cache = None
+        self._max_cache_entries = 32  # Limit cache size
+
+        if not hasattr(self, '_kv_map_expanded'):
+            self.register_buffer('_kv_map_expanded', self.kv_map.view(1, 1, -1))
+
+        # Fused computation for grouped tau
+        if not hasattr(self, '_group_agg_wv'):
+            # Precompute this product once during init
+            with torch.no_grad():
+                self._group_agg_wv = torch.einsum('gh,gd->ghd',
+                                                self.group_agg,
+                                                self.tau_wv_kv)
+                self.register_buffer('_group_agg_wv_cached', self._group_agg_wv)
 
     def _get_pos_log_cached(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Return cached log1p(arange(L)) [L] float32 on device."""
@@ -459,27 +502,37 @@ class AsymGQATransformerBlock(nn.Module):
 
         # Tau computation using already-projected values
         # Single GELU features from q_proj reused for both q and v tau computations
+        # Optimize tau computation with fewer intermediates
+        # GELU features can be computed normally (no need for no_grad)
+        # Compute GELU features once
         tok_feat_q = F.gelu(q_proj).reshape(B, L, self.n_heads, self.head_dim)
-        tau_tok_q = torch.tanh((tok_feat_q * self.tau_wq).sum(dim=-1))  # [B, L, H]
-        # Map per-Q-head features to per-KV-head features via group aggregation
-        # grouped_tok_feat: [B, L, n_kv_heads, head_dim]
-        grouped_tok_feat = torch.einsum('gh,blhd->blgd', self.group_agg, tok_feat_q)
-        tau_tok_v_grouped = torch.tanh((grouped_tok_feat * self.tau_wv_kv).sum(dim=-1))  # [B, L, n_kv_heads]
-        tau_tok_v = tau_tok_v_grouped.gather(2, self.kv_map.view(1,1,-1).expand(B,L,-1))  # [B, L, H]
 
-        # Position term (standardized dtype)
+        # Single einsum for tau_tok_q
+        tau_tok_q = torch.einsum('blhd,hd->blh', tok_feat_q, self.tau_wq)
+        tau_tok_q = torch.tanh(tau_tok_q)
+
+        # Now use the precomputed weights
+        tau_tok_v_grouped = torch.tanh(
+            torch.einsum('blhd,ghd->blg', tok_feat_q, self._group_agg_wv_cached)
+        )
+
+        # Gather using cached expansion
+        tau_tok_v = tau_tok_v_grouped.gather(2, self._kv_map_expanded.expand(B, L, -1))
+
+        # Position computation
         if positions is None:
-            pos_log_1d = self._get_pos_log_cached(L, x.device)  # [L]
-            pos_log = pos_log_1d.view(1, L).expand(B, L)
+            pos_log = self._get_pos_log_cached(L, x.device).unsqueeze(0).expand(B, -1)
         else:
-            positions = positions.to(torch.float32)
-            pos_log = torch.log1p(positions)
-        alpha = torch.sigmoid(self.tau_alpha)
-        tau_pos = 1.0 + alpha.view(1, self.n_heads, 1) * pos_log.view(B, 1, L) - 0.5
+            pos_log = torch.log1p(positions.float())
 
-        # Final taus
-        tau_q = (tau_tok_q.transpose(1, 2) + tau_pos).unsqueeze(-1)
-        tau_v = (tau_tok_v.transpose(1, 2) + tau_pos).unsqueeze(-1)
+        # Alpha and tau_pos computation
+        alpha = torch.sigmoid(self.tau_alpha).view(1, self.n_heads, 1)
+        pos_log_expanded = pos_log.view(B, 1, L)
+        tau_pos = alpha.mul(pos_log_expanded).add_(1.0 - 0.5)
+
+        # Final taus - create new tensors, no in-place modification
+        tau_q = tau_tok_q.transpose(1, 2).add(tau_pos).unsqueeze(-1)
+        tau_v = tau_tok_v.transpose(1, 2).add(tau_pos).unsqueeze(-1)
 
         # Apply gating
         q = q * tau_q
@@ -651,6 +704,11 @@ class AsymGQATransformerBlock(nn.Module):
 
         return x_out, k_all, v_all
 
+@torch.jit.script
+def gray_code_lut_apply(x: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
+    """Fast Gray code lookup - eliminates bounds checking overhead."""
+    x_clamped = torch.clamp(x, min=0, max=lut.shape[0] - 1)
+    return lut[x_clamped]
 
 class XOR8BitLM(nn.Module):
     """Fast XOR-based Language Model with optional MuToR."""
@@ -681,8 +739,6 @@ class XOR8BitLM(nn.Module):
         lut_vals[GrayCodeEncoder.IM_START, 3] = 1
         lut_vals[GrayCodeEncoder.IM_END, 4] = 1
         self.register_buffer('bit_lut', lut_vals.to(torch.float32))
-        # Cache for causal masks by (device, seq_len)
-        self._causal_masks: dict[tuple[str, int], torch.Tensor] = {}
 
         # Bit projection: 8 bits -> d_model
         self.bit_proj = nn.Linear(8, d_model, dtype=dtype)
@@ -709,8 +765,8 @@ class XOR8BitLM(nn.Module):
             print(f"Layer {i}: {g} (KV groups: {len(g)})")
 
         self.layers = nn.ModuleList([
-            AsymGQATransformerBlock(d_model, n_heads, d_model * 4, self.rope, groups, dtype=dtype)
-            for groups in groups_per_layer
+            AsymGQATransformerBlock(d_model, n_heads, d_model * 12 if i == 0 else d_model * 4, self.rope, groups, dtype=dtype)
+            for i, groups in enumerate(groups_per_layer)
         ])
 
         self.norm = RMSNorm(d_model)
@@ -742,8 +798,7 @@ class XOR8BitLM(nn.Module):
     def to_bits(self, x: torch.Tensor) -> torch.Tensor:
         """Convert sequence to bit features (vectorized with LUT)."""
         # Direct LUT indexing for 0..259 (bytes + specials + REGISTER)
-        x_clamped = x.clamp(min=0, max=self.bit_lut.shape[0] - 1)
-        return self.bit_lut[x_clamped]
+        return gray_code_lut_apply(x, self.bit_lut)
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Return cached upper-triangular causal mask of shape [L, L] (bool) using small LRU."""
@@ -880,12 +935,16 @@ class XOR8BitLM(nn.Module):
         return logits, new_past
 
     def _compute_entropy(self, probs):
-        """Compute entropy of probability distribution."""
-        valid = probs > 1e-10
-        if not valid.any():
-            return 0.0
-        p = probs[valid]
-        return -(p * torch.log(p)).sum().item()
+        """Vectorized entropy computation."""
+        # Avoid loops and item() calls
+        mask = probs > 1e-10
+        if not mask.any():
+            return torch.tensor(0.0)
+
+        p_valid = probs[mask]
+        # Use torch operations instead of item()
+        entropy = -(p_valid * torch.log(p_valid)).sum()
+        return entropy  # Keep as tensor until needed
 
     def _apply_top_h(self, sorted_logits, sorted_idx, alpha=0.4):
         """Apply Top-H filtering to already-sorted logits.
@@ -916,12 +975,27 @@ class XOR8BitLM(nn.Module):
         return keep_mask
 
     @torch.no_grad()
-    def generate_with_cache(self, prompt="", max_len=100, temp=1.0, sampling='top_p', top_p=0.95, alpha=0.4, debug=False):
+    def generate_with_cache(self, prompt="", max_len=100, temp=1.0, sampling='top_p', top_p=0.9, alpha=0.4, debug=False, apply_chat_template=False):
         """Generation with KV-cache optimized for MPS/CPU. Supports top-p and top-h sampling."""
         self.eval()
         device = next(self.parameters()).device
 
-        seq = self.encoder.encode(prompt)
+        if apply_chat_template:
+            system_preface = "You are Kulles, created by Rasmus. You are a helpful assistant."
+            base_segs = [
+                self.encoder._encode_qwen_message('system', system_preface),
+                self.encoder._encode_qwen_message('user', prompt)
+            ]
+            parts = [np.array([self.encoder.START], dtype=np.uint16)]
+            parts.extend(base_segs)
+            parts.append(np.array([self.encoder.IM_START], dtype=np.uint16))
+            role_bytes = ("assistant" + "\n").encode('utf-8', errors='ignore')
+            rb = np.frombuffer(role_bytes, dtype=np.uint8)
+            parts.append(self.encoder.gray_lut[rb].astype(np.uint16, copy=False))
+            seq = np.concatenate(parts)
+        else:
+            seq = self.encoder.encode(prompt)
+
         if len(seq) > 0 and seq[-1] == self.encoder.EOS:
             seq = seq[:-1]
         x = torch.from_numpy(seq).long().unsqueeze(0).to(device)
@@ -1017,14 +1091,20 @@ class XOR8BitLM(nn.Module):
             cur_len += 1
             pos_next = torch.tensor([[cur_len - 1]], device=device, dtype=torch.float32)
 
-            # Pass sliced cache and update in place
+            # Pass sliced cache
             current_kv = [(k[:, :, :cur_len-1], v[:, :, :cur_len-1]) for k, v in pre_allocated_kv]
             logits, new_kv = self.forward_with_cache(x_next, positions=pos_next, is_register=None, past_kv=current_kv)
 
-            # Update the pre-allocated cache in place
-            for i, (k_new, v_new) in enumerate(new_kv):
-                pre_allocated_kv[i][0][:, :, :cur_len] = k_new
-                pre_allocated_kv[i][1][:, :, :cur_len] = v_new
+            # Update only the last step in the pre-allocated cache (avoid O(L) copy)
+            if cur_len >= max_cache_len:
+                print(f"[gen-cache] reached max_cache_len={max_cache_len}")
+                break
+
+            # Update only if within bounds
+            if cur_len < max_cache_len:
+                for i, (k_new, v_new) in enumerate(new_kv):
+                    pre_allocated_kv[i][0][:, :, cur_len-1:cur_len] = k_new[:, :, -1:]
+                    pre_allocated_kv[i][1][:, :, cur_len-1:cur_len] = v_new[:, :, -1:]
 
             if debug:
                 last_tokens = x[0, -4:].tolist() if x.size(1) >= 4 else x[0].tolist()
@@ -1483,11 +1563,11 @@ class Trainer:
         if (self.step + 1) % self.grad_accum_steps == 0:
             if self.scaler:
                 self.scaler.unscale_(self.opt)
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.opt)
                 self.scaler.update()
             else:
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.opt.step()
 
             self.opt.zero_grad(set_to_none=True)
@@ -1938,7 +2018,7 @@ def train(
         val_loader = DataLoader(val_dataset, batch_size, **_loader_kwargs(for_eval=True))
 
     # Create model once and reuse across stages
-    model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base, mutor_dmax=3)
+    model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base, mutor_dmax=20)
 
     # Compile for speed (PyTorch 2.0+)
     if compile_model and hasattr(torch, 'compile'):
@@ -1954,6 +2034,8 @@ def train(
         if stage_name == 'school':
             # Freeze lower layers and bit projection
             n_freeze = int(len(model.layers) * 0.6)  # Freeze 60% of layers
+
+            mutor_bit_divergence_weight = 0.25
 
             # Freeze bit projection
             model.bit_proj.weight.requires_grad = False
@@ -2120,14 +2202,19 @@ def train(
 def run_test_generations(model: XOR8BitLM, input_text: str, max_len: int = 512):
     model.eval()
     output = model.generate_with_cache(input_text, max_len=max_len)
-    print(f"\nGenerated (top-k, temp=1.0):\n{output}")
+    print(f"\nGenerated (top-k, temp=1.0):\n{output}\n")
     output = model.generate_with_cache(input_text, max_len=max_len, temp=0.5)
-    print(f"\nGenerated (top-k, temp=0.5):\n{output}")
+    print(f"\nGenerated (top-k, temp=0.5):\n{output}\n")
 
     output = model.generate_with_cache(input_text, max_len=max_len, sampling='top_h')
-    print(f"\nGenerated (top-h, temp=1.0):\n{output}")
+    print(f"\nGenerated (top-h, temp=1.0):\n{output}\n")
     output = model.generate_with_cache(input_text, max_len=max_len, sampling='top_h', temp=0.5)
-    print(f"\nGenerated (top-h, temp=0.5):\n{output}")
+    print(f"\nGenerated (top-h, temp=0.5):\n{output}\n")
+
+    output = model.generate_with_cache("What is 2 + 2?", max_len=512, apply_chat_template=True)
+    print(f"\nGenerated (chat template, temp=1.0):\n{output}\n")
+    output = model.generate_with_cache("What is 2 + 2?", max_len=512, apply_chat_template=True, sampling='top_h')
+    print(f"\nGenerated (chat template, top-h):\n{output}\n")
 
 # ============= EXAMPLE USAGE =============
 
@@ -2172,8 +2259,8 @@ CORIOLANUS:
         # Train example (uncomment to run)
         model = train(
             "datasets/packed",
-            seq_length=2048,
-            batch_size=2,
+            seq_length=3072,
+            batch_size=4,
             epochs=5,
             d_model=512,
             n_heads=8,
@@ -2184,6 +2271,7 @@ CORIOLANUS:
                 {
                     'name': 'pretrain',
                     'packed_roots': [
+                        'datasets/packed/tiny-stories',
                         'datasets/packed/orca-pre',
                         'datasets/packed/tiny-lessons',
                         'datasets/packed/tiny-textbooks',
@@ -2198,17 +2286,17 @@ CORIOLANUS:
                         'datasets/packed/orca-inst',
                     ],
 
-                    'steps': 100,
-                    'lr': 2e-4
+                    'steps': 2000,
+                    'lr': 5e-5
                 }
             ]
         )
 
-    output = model.generate_with_cache("Maailm on karm.", max_len=512)
+    output = model.generate_with_cache("What is 2 + 2?", max_len=512, apply_chat_template=True)
     print(f"\nGenerated: {output}")
 
-    output = model.generate_with_cache("Elu on ilus.", max_len=512)
-    print(f"\nGenerated: {output}")
+    # output = model.generate_with_cache("Elu on ilus.", max_len=512)
+    #print(f"\nGenerated: {output}")
 
     run_test_generations(model, "The world is a cold place.", max_len=512)
 

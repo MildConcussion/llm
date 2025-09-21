@@ -365,6 +365,7 @@ def pack_hf_qwen_with_masks(
     target_audiences: List[str] | None = None,
     shard_tokens: int = 5_000_000,
     max_encoded_len: int | None = None,
+    max_docs: int | None = None,
 ) -> None:
     """
     Pack HF datasets into shards with tokens.mmap and loss_mask.mmap using Qwen-style messages.
@@ -399,6 +400,7 @@ def pack_hf_qwen_with_masks(
     doc_offsets: List[int] = []
     doc_lengths: List[int] = []
     skipped_too_long = 0
+    processed_docs = 0
 
     def _flush_shard():
         nonlocal shard_idx, shard_tokens_accum, token_chunks, mask_chunks, doc_offsets, doc_lengths
@@ -455,9 +457,10 @@ def pack_hf_qwen_with_masks(
         mask_chunks.append(mask_arr)
         doc_lengths.append(int(tokens_arr.shape[0]))
         shard_tokens_accum += int(tokens_arr.shape[0])
+        processed_docs += 1
 
     def _maybe_flush():
-        if shard_tokens_accum >= shard_tokens:
+        if shard_tokens_accum >= shard_tokens or (max_docs is not None and processed_docs >= max_docs):
             _flush_shard()
 
     for ex in tqdm(ds, desc=f"Packing {task_type} -> {output_dir}"):
@@ -475,6 +478,8 @@ def pack_hf_qwen_with_masks(
                 toks = _concat_segments_with_bookends(encoder, [seg])
                 if max_encoded_len is not None and int(toks.shape[0]) > int(max_encoded_len):
                     skipped_too_long += 1
+                    continue
+                if max_docs is not None and processed_docs >= max_docs:
                     continue
                 mask = np.ones_like(toks, dtype=np.uint8)
                 # Keep START/EOS contributing to mask as well (or set to 0 if preferred)
@@ -499,6 +504,8 @@ def pack_hf_qwen_with_masks(
                 toks = _concat_segments_with_bookends(encoder, segs + [asst_seg])
                 if max_encoded_len is not None and int(toks.shape[0]) > int(max_encoded_len):
                     skipped_too_long += 1
+                    continue
+                if max_docs is not None and processed_docs >= max_docs:
                     continue
                 mask = np.zeros_like(toks, dtype=np.uint8)
                 # Build mask over assistant content: find boundaries inside asst_seg
@@ -538,6 +545,8 @@ def pack_hf_qwen_with_masks(
                     toks = _concat_segments_with_bookends(encoder, segs)
                     if max_encoded_len is not None and int(toks.shape[0]) > int(max_encoded_len):
                         skipped_too_long += 1
+                        continue
+                    if max_docs is not None and processed_docs >= max_docs:
                         continue
                     mask = np.zeros_like(toks, dtype=np.uint8)
                     asst_total = asst_seg.shape[0]
@@ -608,6 +617,7 @@ if __name__ == '__main__':
     ap_hfq.add_argument('--target_audiences', nargs='*', default=None, help='Filter for codes: audiences in ascending difficulty order')
     ap_hfq.add_argument('--shard_tokens', type=int, default=5_000_000)
     ap_hfq.add_argument('--max_encoded_len', type=int, default=None)
+    ap_hfq.add_argument('--max_docs', type=int, default=None)
     args = ap.parse_args()
     if args.cmd == 'local':
         pack_to_memmap(args.inputs, args.out, shard_tokens=args.shard_tokens, max_encoded_len=args.max_encoded_len)
@@ -635,6 +645,7 @@ if __name__ == '__main__':
             target_audiences=args.target_audiences,
             shard_tokens=args.shard_tokens,
             max_encoded_len=args.max_encoded_len,
+            max_docs=args.max_docs,
         )
 
 

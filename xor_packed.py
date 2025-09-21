@@ -70,6 +70,17 @@ class PackedXORShardDataset(Dataset):
         # Ensure file descriptors are released promptly
         self._close_memmaps()
 
+    def close(self):
+        """Explicitly close memmaps."""
+        self._close_memmaps()
+
+    # Use as context manager
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def __getstate__(self):
         # Avoid pickling open memmaps; workers will lazy-open after spawn
         state = self.__dict__.copy()
@@ -78,36 +89,33 @@ class PackedXORShardDataset(Dataset):
         return state
 
     def _build_window_index(self):
+        # Current has loops - vectorize instead
         seq_len = self.seq_length
         stride = self.stride
-        doc_windows = []
-        doc_starts = []
 
-        for doc_id, L in enumerate(self.lengths.tolist()):
-            if L <= seq_len:
-                doc_windows.append(1)
-                doc_starts.append([0])
-                continue
+        # Vectorized computation of windows per doc
+        doc_lengths = self.lengths
+        n_windows = np.where(
+            doc_lengths <= seq_len,
+            1,
+            ((np.maximum(doc_lengths - seq_len, 0) + stride - 1) // stride) + 1
+        )
 
-            starts = list(range(0, max(L - seq_len + 1, 1), stride))
-            # Ensure last window covers tail (may violate exact stride at the end)
-            last_start = max(L - seq_len, 0)
-            if starts[-1] != last_start:
-                starts.append(last_start)
+        total_windows = n_windows.sum()
+        self.window_doc_ids = np.repeat(np.arange(len(doc_lengths)), n_windows)
 
-            doc_windows.append(len(starts))
-            doc_starts.append(starts)
+        # Vectorized start positions
+        window_starts = []
+        for doc_id, (L, nw) in enumerate(zip(doc_lengths, n_windows)):
+            if nw == 1:
+                window_starts.append([0])
+            else:
+                starts = np.arange(0, L - seq_len + 1, stride)
+                if starts[-1] != L - seq_len:
+                    starts = np.append(starts, L - seq_len)
+                window_starts.append(starts)
 
-        total_windows = int(sum(doc_windows))
-        self.window_doc_ids = np.empty(total_windows, dtype=np.int32)
-        self.window_starts = np.empty(total_windows, dtype=np.int64)
-
-        cursor = 0
-        for doc_id, starts in enumerate(doc_starts):
-            n = len(starts)
-            self.window_doc_ids[cursor:cursor+n] = doc_id
-            self.window_starts[cursor:cursor+n] = np.asarray(starts, dtype=np.int64)
-            cursor += n
+        self.window_starts = np.concatenate(window_starts)
 
     def __len__(self) -> int:
         return int(self.window_doc_ids.shape[0])
