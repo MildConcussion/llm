@@ -464,6 +464,10 @@ def pack_hf_qwen_with_masks(
         try:
             if task_type == 'pretrain_text':
                 text = ex.get('textbook', None)
+
+                if text is None:
+                    text = ex.get('text', None)
+
                 if text is None:
                     continue
                 body = np.frombuffer(str(text).encode('utf-8', errors='ignore'), dtype=np.uint8)

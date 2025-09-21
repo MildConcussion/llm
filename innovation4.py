@@ -1923,6 +1923,24 @@ def train(
         planned_total = steps_per_epoch * stage_epochs
         effective_total = planned_total if stage_steps is None else min(planned_total, int(stage_steps))
         print(f"[stage] {stage_name}: steps_per_epoch={steps_per_epoch}, planned_total={planned_total}, effective_total={effective_total}")
+
+
+        if stage_name == 'school':
+            # Freeze lower layers and bit projection
+            n_freeze = int(len(model.layers) * 0.6)  # Freeze 60% of layers
+
+            # Freeze bit projection
+            model.bit_proj.weight.requires_grad = False
+
+            # Freeze RoPE (positional encoding)
+            for param in model.rope.parameters():
+                param.requires_grad = False
+
+            # Freeze lower transformer layers
+            for i in range(n_freeze):
+                for param in model.layers[i].parameters():
+                    param.requires_grad = False
+
         trainer = Trainer(
             model,
             lr=stage_lr,
@@ -2127,7 +2145,9 @@ CORIOLANUS:
                     'name': 'pretrain',
                     'packed_roots': [
                         'datasets/packed/orca-pre',
-                        'datasets/packed/tiny-lessons'
+                        'datasets/packed/tiny-lessons',
+                        'datasets/packed/tiny-textbooks',
+                        'datasets/packed/tiny-superwiki'
                     ],
                     'epochs': 1,
                     'lr': 3e-4
