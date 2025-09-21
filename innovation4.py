@@ -461,7 +461,10 @@ class AsymGQATransformerBlock(nn.Module):
                 raise ValueError(f"Unsupported mask shape: {mask.shape}")
             scores.masked_fill_(mask_norm, -float('inf'))
         if key_padding_mask is not None:
-            scores.masked_fill_(key_padding_mask[:, None, None, :], -float('inf'))
+            # Mask both rows (queries from PAD) and columns (keys that are PAD)
+            key_mask_expanded = key_padding_mask[:, None, None, :]  # [B, 1, 1, L]
+            query_mask_expanded = key_padding_mask[:, None, :, None]  # [B, 1, L, 1]
+            scores.masked_fill_(key_mask_expanded | query_mask_expanded, -float('inf'))
 
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
@@ -643,6 +646,11 @@ class XOR8BitLM(nn.Module):
         # Single learnable register embedding (additive bias)
         self.register_bias = nn.Parameter(torch.zeros(d_model))
 
+        # Optional offset-aware register embeddings (index 0 reserved for non-register)
+        if self.mutor_dmax > 0:
+            self.offset_embeddings = nn.Embedding(self.mutor_dmax + 1, d_model, dtype=dtype)
+            self._init_offset_embeddings()
+
         # RoPE for positional encoding
         if d_model % n_heads != 0 or ((d_model // n_heads) % 2 != 0):
             raise ValueError(
@@ -674,6 +682,17 @@ class XOR8BitLM(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+
+    def _init_offset_embeddings(self):
+        """Initialize offset embeddings with Gray code-inspired pattern; index 0 is zero."""
+        with torch.no_grad():
+            self.offset_embeddings.weight.zero_()
+            # Indices 1..dmax get structured initialization
+            for i in range(1, self.mutor_dmax + 1):
+                gray = i ^ (i >> 1)
+                bits = torch.tensor([(gray >> b) & 1 for b in range(8)], dtype=torch.float32, device=self.offset_embeddings.weight.device)
+                pattern = bits.repeat(self.d_model // 8 + 1)[:self.d_model]
+                self.offset_embeddings.weight[i].copy_(pattern * 0.02)
 
     @torch.jit.export
     def to_bits(self, x: torch.Tensor) -> torch.Tensor:
@@ -716,6 +735,9 @@ class XOR8BitLM(nn.Module):
         """Forward pass with optional MuToR positions/registers support."""
         B, L = x.shape
 
+        if (x == self.encoder.PAD).all():
+            return torch.zeros(B, L, len(self.encoder), device=x.device, dtype=self.param_dtype)
+
         # Convert to bits and project
         bits = self.to_bits(x)
         h = self.bit_proj(bits)
@@ -740,6 +762,34 @@ class XOR8BitLM(nn.Module):
             h = layer(h, mask, key_padding_mask, positions=positions)
 
         # Final norm and output
+        h = self.norm(h)
+        return self.out(h)
+
+    def forward_mutor_sparse(self, x: torch.Tensor, register_offsets: torch.Tensor | None = None) -> torch.Tensor:
+        """Single-stream sparse MuToR forward.
+        - x: [B, L] token ids
+        - register_offsets: [B, L] int64, 0 for non-register, 1..dmax for register positions
+        """
+        B, L = x.shape
+
+        # Bit projection
+        bits = self.to_bits(x)
+        h = self.bit_proj(bits)
+
+        # Add offset embeddings where provided
+        if register_offsets is not None and hasattr(self, 'offset_embeddings'):
+            if register_offsets.dtype != torch.long:
+                register_offsets = register_offsets.to(torch.long)
+            h = h + self.offset_embeddings(register_offsets)
+
+        # Standard causal mask
+        mask = self._get_causal_mask(L, x.device)
+        key_padding_mask = (x == self.encoder.PAD)
+
+        # Transformer stack
+        for layer in self.layers:
+            h = layer(h, mask, key_padding_mask, positions=None)
+
         h = self.norm(h)
         return self.out(h)
 
@@ -785,9 +835,45 @@ class XOR8BitLM(nn.Module):
         logits = self.out(h)
         return logits, new_past
 
+    def _compute_entropy(self, probs):
+        """Compute entropy of probability distribution."""
+        valid = probs > 1e-10
+        if not valid.any():
+            return 0.0
+        p = probs[valid]
+        return -(p * torch.log(p)).sum().item()
+
+    def _apply_top_h(self, sorted_logits, sorted_idx, alpha=0.4):
+        """Apply Top-H filtering to already-sorted logits.
+        Returns mask for tokens to keep."""
+
+        # Get probabilities from sorted logits
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+
+        # Compute full distribution entropy (for threshold)
+        full_entropy = self._compute_entropy(sorted_probs)
+        threshold = alpha * full_entropy
+
+        # Build subset iteratively, tracking entropy
+        keep_mask = torch.zeros_like(sorted_probs, dtype=torch.bool)
+        keep_mask[..., 0] = True  # Always keep top token
+
+        for i in range(1, min(100, sorted_probs.shape[-1])):  # Limit search to top-100 for speed
+            if sorted_probs[..., i] < 1e-10:
+                break
+            keep_mask[..., i] = True
+            # Compute entropy of current subset
+            subset_probs = sorted_probs[keep_mask]
+            subset_probs = subset_probs / subset_probs.sum()
+            if self._compute_entropy(subset_probs) > threshold:
+                keep_mask[..., i] = False  # Remove last token
+                break
+
+        return keep_mask
+
     @torch.no_grad()
-    def generate_with_cache(self, prompt="", max_len=100, temp=1.0, top_p=0.9, debug=False):
-        """Top-p sampling with KV-cache optimized for MPS/CPU."""
+    def generate_with_cache(self, prompt="", max_len=100, temp=1.0, sampling='top_p', top_p=0.95, alpha=0.4, debug=False):
+        """Generation with KV-cache optimized for MPS/CPU. Supports top-p and top-h sampling."""
         self.eval()
         device = next(self.parameters()).device
 
@@ -804,7 +890,27 @@ class XOR8BitLM(nn.Module):
         # Prime cache with initial context
         logits, past_kv = self.forward_with_cache(x, positions=pos, is_register=None, past_kv=None)
 
+        # Pre-allocate cache for maximum sequence length
+        max_cache_len = min(cur_len + max_len, self.rope.max_seq_len)
+        pre_allocated_kv = []
+        for k, v in past_kv:
+            # Allocate full-size tensors
+            k_cache = torch.zeros(k.size(0), k.size(1), max_cache_len, k.size(3),
+                                device=device, dtype=k.dtype)
+            v_cache = torch.zeros(v.size(0), v.size(1), max_cache_len, v.size(3),
+                                device=device, dtype=v.dtype)
+            # Copy initial context
+            k_cache[:, :, :cur_len] = k
+            v_cache[:, :, :cur_len] = v
+            pre_allocated_kv.append((k_cache, v_cache))
+
         for _ in range(max_len):
+            # Stop if cache is full to avoid overflow writes
+            if cur_len >= max_cache_len:
+                if debug:
+                    print(f"[gen-cache] reached max_cache_len={max_cache_len}; stopping to avoid cache overflow")
+                break
+
             # Last token logits
             last_logits = logits[:, -1, :] / temp
             last_logits[..., self.encoder.START] = -float('inf')
@@ -821,17 +927,26 @@ class XOR8BitLM(nn.Module):
                 if debug:
                     print("[gen-cache] fallback logits")
 
+            # Sort logits once
             sorted_logits, sorted_idx = torch.sort(last_logits, descending=True)
             sorted_logits = torch.where(
                 torch.isfinite(sorted_logits), sorted_logits, torch.full_like(sorted_logits, -1e10)
             )
-            sorted_probs = F.softmax(sorted_logits, dim=-1)
-            cumsum = torch.cumsum(sorted_probs, dim=-1)
-            keep_mask = cumsum <= top_p
-            keep_mask[..., 0] = True
+
+            # Apply sampling method
+            if sampling == 'top_h':
+                keep_mask = self._apply_top_h(sorted_logits, sorted_idx, alpha)
+            else:  # top_p
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumsum = torch.cumsum(sorted_probs, dim=-1)
+                keep_mask = cumsum <= top_p
+                keep_mask[..., 0] = True
+
+            # Apply mask and get final probabilities
             sorted_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -float('inf')))
             probs = F.softmax(sorted_logits, dim=-1)
 
+            # Check for valid probabilities and sample
             if not torch.isfinite(probs).all() or (probs < 0).any() or probs.sum() == 0:
                 probs = torch.zeros_like(last_logits)
                 probs[..., :256] = 1.0 / 256
@@ -853,7 +968,14 @@ class XOR8BitLM(nn.Module):
             cur_len += 1
             pos_next = torch.tensor([[cur_len - 1]], device=device, dtype=torch.float32)
 
-            logits, past_kv = self.forward_with_cache(x_next, positions=pos_next, is_register=None, past_kv=past_kv)
+            # Pass sliced cache and update in place
+            current_kv = [(k[:, :, :cur_len-1], v[:, :, :cur_len-1]) for k, v in pre_allocated_kv]
+            logits, new_kv = self.forward_with_cache(x_next, positions=pos_next, is_register=None, past_kv=current_kv)
+
+            # Update the pre-allocated cache in place
+            for i, (k_new, v_new) in enumerate(new_kv):
+                pre_allocated_kv[i][0][:, :, :cur_len] = k_new
+                pre_allocated_kv[i][1][:, :, :cur_len] = v_new
 
             if debug:
                 last_tokens = x[0, -4:].tolist() if x.size(1) >= 4 else x[0].tolist()
@@ -1002,10 +1124,17 @@ class Trainer:
 
     def __init__(self, model: XOR8BitLM, lr=3e-4, warmup_steps=1000,
                  weight_decay=0.1, grad_accum_steps=1, device='cuda',
-                 total_steps: int | None = None, ema_alpha=0.99):
+                 total_steps: int | None = None, ema_alpha=0.99,
+                 mutor_mode: str = 'entropy',
+                 mutor_density_ratio: float = 0.15,
+                 mutor_min_spacing: int = 4,
+                 mutor_update_every: int = 5,
+                 mutor_buffer_momentum: float = 0.95,
+                 mutor_bit_divergence_weight: float = 0.3):
         self.model = model.to(device)
         self.device = device
         self.grad_accum_steps = grad_accum_steps
+        self.mutor_mode = mutor_mode
 
         print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -1024,7 +1153,14 @@ class Trainer:
         for name, param in model.named_parameters():
             if not param.requires_grad:
               continue  # frozen weights
-            if len(param.shape) == 1 or "bit_proj" in name or name.endswith('.bias') or '.norm' in name or name.endswith('.scale') or name.endswith('.shift'):
+            if (len(param.shape) == 1 or
+                "bit_proj" in name or
+                name.endswith('.bias') or
+                '.norm' in name or
+                name.endswith('.scale') or
+                name.endswith('.shift') or
+                'register_embedding' in name or  # Add this
+                'offset_embeddings' in name):     # Add this
                 no_decay_names.add(name)
             else:
                 decay_names.add(name)
@@ -1075,6 +1211,20 @@ class Trainer:
             autocast_ctx = contextlib.nullcontext()
 
         self.autocast_ctx = autocast_ctx
+
+        # Entropy MuToR controller (single-stream sparse)
+        self.mutor_controller: EntropyMuToRController | None = None
+        if self.mutor_mode == 'entropy' and getattr(self.model, 'mutor_dmax', 0) > 0:
+            self.mutor_controller = EntropyMuToRController(
+                max_seq_len=getattr(self.model.rope, 'max_seq_len', 2048),
+                dmax=getattr(self.model, 'mutor_dmax', 3),
+                density_ratio=mutor_density_ratio,
+                min_spacing=mutor_min_spacing,
+                update_every=mutor_update_every,
+                momentum=mutor_buffer_momentum,
+                bit_divergence_weight=mutor_bit_divergence_weight,
+                device=self.device
+            )
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader, max_batches: int = None, use_mutor: bool = True) -> tuple[float, float]:
@@ -1138,10 +1288,79 @@ class Trainer:
         targets = batch[:, 1:]
 
         with self.autocast_ctx:
-            if use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0:
+            if use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0 and self.mutor_mode == 'dense':
+                # Legacy dense MuToR path
                 aug_batch, positions, is_register, aug_targets = mutor_augment_batch(inputs, targets, self.model, self.device)
                 logits = self.model(aug_batch, positions=positions, is_register=is_register)
                 loss = compute_mutor_loss(logits, aug_targets, is_register, self.encoder.PAD, alpha=self.model.mutor_alpha)
+            elif use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0 and self.mutor_mode == 'entropy' and self.mutor_controller is not None:
+                # Entropy-guided single-stream sparse MuToR
+                B, L = inputs.shape
+                # Early features for difficulty
+                bits = self.model.to_bits(inputs)  # [B, L, 8]
+                h0 = self.model.bit_proj(bits)     # [B, L, D]
+
+                # Compute difficulty and update EMA buffer
+                layer0 = self.model.layers[0]
+                difficulty = self.mutor_controller.compute_difficulty(h0, bits, layer0)  # [B, L]
+                self.mutor_controller.update_buffer(difficulty)
+
+                # Select registers using buffer for stability
+                buffer_view = self.mutor_controller.difficulty_buffer[:L].unsqueeze(0).expand(B, -1)
+                register_mask = self.mutor_controller.select_registers(buffer_view)  # [B, L] bool
+
+                # Adaptive offsets from current difficulty
+                register_offsets = self.mutor_controller.compute_offsets(difficulty, register_mask)  # [B, L] long
+
+                # Valid lookahead positions: i + offset < batch.shape[1]
+                idx = torch.arange(L, device=self.device).view(1, -1)
+                target_pos = idx + register_offsets
+                batch_len = batch.shape[1]
+                reg_valid = register_mask & (target_pos < batch_len)
+
+                # Forward once with offsets
+                logits = self.model.forward_mutor_sparse(inputs, register_offsets=register_offsets)
+
+                # Build combined targets and weights
+                V = logits.size(-1)
+                pad_id = self.encoder.PAD
+                combined_targets = torch.full((B, L), pad_id, device=self.device, dtype=torch.long)
+
+                # Non-register positions use next-token
+                non_reg_mask = ~register_mask
+                combined_targets[non_reg_mask] = targets[non_reg_mask]
+
+                # Register positions use lookahead (where valid)
+                clamped_pos = target_pos.clamp(max=batch_len - 1)
+                lookahead_targets = batch.gather(dim=1, index=clamped_pos)
+                combined_targets[reg_valid] = lookahead_targets[reg_valid]
+
+                # Position weights: alpha at valid registers, (1-alpha) elsewhere
+                weights = torch.full((B, L), 1.0 - self.model.mutor_alpha, device=self.device, dtype=logits.dtype)
+                weights[reg_valid] = self.model.mutor_alpha
+
+                # Compute weighted CE loss over valid positions
+                per_pos_loss = F.cross_entropy(
+                    logits.reshape(B * L, V),
+                    combined_targets.reshape(B * L),
+                    ignore_index=pad_id,
+                    reduction='none'
+                ).view(B, L)
+
+                valid_mask = combined_targets != pad_id
+                if valid_mask.any():
+                    loss = (per_pos_loss[valid_mask] * weights[valid_mask]).mean()
+                else:
+                    # Fallback: no valid positions, use standard next-token loss
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, V),
+                        targets.reshape(-1),
+                        ignore_index=pad_id
+                    )
+
+                if os.environ.get('MUTOR_DEBUG', '0') == '1':
+                    num_regs = register_mask.sum().item()
+                    print(f"[mutor-sparse] regs={num_regs} ({num_regs/(B*L+1e-6):.3f}), offsets∈[1..{self.model.mutor_dmax}], valid={reg_valid.sum().item()}")
             else:
                 logits = self.model(inputs)
                 loss = F.cross_entropy(
@@ -1218,6 +1437,109 @@ class Trainer:
 
 # ============= UTILS =============
 
+class EntropyMuToRController:
+    """Controller for single-stream sparse MuToR selection and offsets.
+
+    Maintains a per-position EMA difficulty buffer to amortize selection cost and stabilize choices.
+    """
+
+    def __init__(self,
+                 max_seq_len: int,
+                 dmax: int = 3,
+                 density_ratio: float = 0.15,
+                 min_spacing: int = 4,
+                 update_every: int = 5,
+                 momentum: float = 0.95,
+                 bit_divergence_weight: float = 0.3,
+                 device: torch.device | str = 'cpu'):
+        self.dmax = int(dmax)
+        self.density_ratio = float(density_ratio)
+        self.min_spacing = int(min_spacing)
+        self.update_every = int(update_every)
+        self.momentum = float(momentum)
+        self.bit_div_w = float(bit_divergence_weight)
+        self.max_seq_len = int(max_seq_len)
+        self.device = torch.device(device)
+
+        self.difficulty_buffer = torch.zeros(self.max_seq_len, device=self.device, dtype=torch.float32)
+        self.update_counts = torch.zeros(self.max_seq_len, device=self.device, dtype=torch.int32)
+        self._step = 0
+
+    @torch.no_grad()
+    def compute_difficulty(self, h0: torch.Tensor, bits: torch.Tensor, layer0: nn.Module) -> torch.Tensor:
+        """Compute multi-signal difficulty without logits.
+        h0: [B, L, D] projected bit features
+        bits: [B, L, 8] float32 0/1
+        Returns difficulty in [0,1]: [B, L]
+        """
+        B, L, D = h0.shape
+
+        # Normalize hidden states and compute entropy proxy (std/mean)
+        h_norm = layer0.norm1(h0)
+        mean = h_norm.mean(dim=-1)
+        std = h_norm.std(dim=-1)
+        h_entropy = std / (mean.abs() + 1e-6)
+        h_entropy = torch.tanh(h_entropy)  # squash to ~[0,1]
+
+        # Bit divergence via Hamming distance between neighbors
+        flips = (bits[:, 1:, :] != bits[:, :-1, :]).float().mean(dim=-1)
+        bit_div = F.pad(flips, (0, 1), value=0.0)
+
+        # Attention uncertainty proxy from q/k projections (variance across heads)
+        q = layer0.q_proj(h_norm).view(B, L, layer0.n_heads, layer0.head_dim)
+        k = layer0.k_proj(h_norm).view(B, L, layer0.n_kv_heads, layer0.head_dim)
+        # Map k to per-q head via kv_map to match head counts for the proxy (approximate)
+        k_heads = k[:, :, layer0.kv_map, :]
+        qk = (q * k_heads).sum(dim=-1)  # [B, L, H]
+        qk_var = qk.var(dim=-1)
+        attn_unc = torch.sigmoid(qk_var)
+
+        # Weighted combination
+        difficulty = (0.4 * h_entropy) + (self.bit_div_w * bit_div) + (0.3 * attn_unc)
+        difficulty = difficulty.clamp(0.0, 1.0)
+        return difficulty
+
+    @torch.no_grad()
+    def update_buffer(self, difficulty: torch.Tensor):
+        """EMA update for per-position difficulty buffer using batch mean."""
+        B, L = difficulty.shape
+        if (self._step % self.update_every) == 0:
+            batch_mean = difficulty.mean(dim=0)
+            prev = self.difficulty_buffer[:L]
+            self.difficulty_buffer[:L] = self.momentum * prev + (1.0 - self.momentum) * batch_mean
+            self.update_counts[:L] += 1
+        self._step += 1
+
+    @torch.no_grad()
+    def select_registers(self, difficulty: torch.Tensor) -> torch.Tensor:
+        """Select register positions per batch with min spacing. Returns bool mask [B, L]."""
+        B, L = difficulty.shape
+        k = max(1, int(self.density_ratio * L))
+        # Candidates by top scores per batch
+        scores, idx = torch.topk(difficulty, k=min(k * 2, L), dim=1, largest=True, sorted=True)
+        mask = torch.zeros(B, L, dtype=torch.bool, device=difficulty.device)
+        for b in range(B):
+            selected = 0
+            last_pos = -self.min_spacing
+            for pos in idx[b].tolist():
+                if pos - last_pos >= self.min_spacing:
+                    mask[b, pos] = True
+                    last_pos = pos
+                    selected += 1
+                    if selected >= k:
+                        break
+        return mask
+
+    @torch.no_grad()
+    def compute_offsets(self, difficulty: torch.Tensor, register_mask: torch.Tensor) -> torch.Tensor:
+        """Map difficulty to offsets in [1..dmax] at register positions, else 0."""
+        B, L = difficulty.shape
+        scaled = (difficulty * (self.dmax - 1)).floor().to(torch.long) + 1
+        scaled = scaled.clamp_(1, self.dmax)
+        offsets = torch.zeros(B, L, dtype=torch.long, device=difficulty.device)
+        offsets[register_mask] = scaled[register_mask]
+        return offsets
+
 def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8BitLM, device: torch.device):
     """Augment batch with interleaved REGISTER tokens and build positions/targets.
     inputs: [B, L], targets: [B, L] (next-token targets for inputs)
@@ -1240,8 +1562,12 @@ def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8
     # Even (original tokens): 0..L-1
     base_pos = torch.arange(L, device=device, dtype=torch.long)
     positions[:, 0::2] = base_pos.to(torch.float32)
-    # Odd (registers): pos = min(p + d - 1, L - 1)
-    reg_pos = torch.clamp(base_pos + (d - 1), max=L - 1)
+
+    # Odd indices (registers): L-1 positions
+    # Register i (at position 2i+1) corresponds to token i (at position 2i)
+    # So we need positions for tokens 0..L-2 (which have registers after them)
+    reg_base_pos = base_pos[:-1]  # positions 0..L-2 (L-1 elements)
+    reg_pos = torch.clamp(reg_base_pos + (d - 1), max=L - 1)
     positions[:, 1::2] = reg_pos.to(torch.float32)
 
     is_register = (aug_batch == int(model.encoder.REGISTER))
@@ -1250,9 +1576,13 @@ def mutor_augment_batch(inputs: torch.Tensor, targets: torch.Tensor, model: XOR8
     aug_targets = torch.full_like(aug_batch, model.encoder.PAD)
     # Next-token targets at even indices
     aug_targets[:, 0::2] = targets
-    # Register targets: token at index min(p + d, L - 1) from inputs
-    reg_target_idx = torch.clamp(base_pos + d, max=L - 1)
-    reg_targets = inputs[:, reg_target_idx]
+    # Register targets: for register i (after token i), predict token at i+d
+    # Register i is at odd position 2i+1, corresponds to token i
+    reg_target_idx = torch.clamp(reg_base_pos + d, max=L - 1)  # L-1 elements
+    reg_targets = inputs.gather(1, reg_target_idx.unsqueeze(0).expand(B, -1))
+    # Mask out PAD tokens - don't predict PAD as register output
+    pad_mask = (inputs[:, :-1] == model.encoder.PAD)  # Which source positions are PAD
+    reg_targets = torch.where(pad_mask, model.encoder.PAD, reg_targets)
     aug_targets[:, 1::2] = reg_targets
 
     if os.environ.get('MUTOR_DEBUG', '0') == '1':
@@ -1359,6 +1689,13 @@ def train(
     mixing_policy: str = 'round_robin',  # 'round_robin' or 'weighted'
     mixing_weights: Optional[List[float]] = None,
     test_prompt: str = "The ",
+    # MuToR new flags
+    mutor_mode: str = 'entropy',  # 'entropy' | 'dense' | 'off'
+    mutor_density_ratio: float = 0.15,
+    mutor_min_spacing: int = 4,
+    mutor_update_every: int = 5,
+    mutor_buffer_momentum: float = 0.95,
+    mutor_bit_divergence_weight: float = 0.3,
 ):
     """Complete training pipeline."""
 
@@ -1447,7 +1784,7 @@ def train(
     val_loader = DataLoader(val_dataset, batch_size, **_loader_kwargs(for_eval=True))
 
     # Create model
-    model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base)
+    model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base, mutor_dmax=3)
 
     # Compile for speed (PyTorch 2.0+)
     if compile_model and hasattr(torch, 'compile'):
@@ -1456,8 +1793,20 @@ def train(
     # Create trainer with correct OneCycle total steps
     steps_per_epoch = max(len(train_loader), 1)
     total_steps = steps_per_epoch * epochs
-    trainer = Trainer(model, lr=lr, device=device, total_steps=total_steps,
-                      warmup_steps=min(1000, total_steps // 10), ema_alpha=ema_alpha)
+    trainer = Trainer(
+        model,
+        lr=lr,
+        device=device,
+        total_steps=total_steps,
+        warmup_steps=min(1000, total_steps // 10),
+        ema_alpha=ema_alpha,
+        mutor_mode=mutor_mode,
+        mutor_density_ratio=mutor_density_ratio,
+        mutor_min_spacing=mutor_min_spacing,
+        mutor_update_every=mutor_update_every,
+        mutor_buffer_momentum=mutor_buffer_momentum,
+        mutor_bit_divergence_weight=mutor_bit_divergence_weight,
+    )
 
     val_iter = itertools.cycle(val_loader)
 
@@ -1553,6 +1902,18 @@ def train_from_hf(dataset_name: str, **kwargs):
     Path(temp_path).unlink()
     return model
 
+def run_test_generations(model: XOR8BitLM, input_text: str, max_len: int = 512):
+    model.eval()
+    output = model.generate_with_cache(input_text, max_len=max_len)
+    print(f"\nGenerated (top-k, temp=1.0):\n{output}")
+    output = model.generate_with_cache(input_text, max_len=max_len, temp=0.5)
+    print(f"\nGenerated (top-k, temp=0.5):\n{output}")
+
+    output = model.generate_with_cache(input_text, max_len=max_len, sampling='top_h')
+    print(f"\nGenerated (top-h, temp=1.0):\n{output}")
+    output = model.generate_with_cache(input_text, max_len=max_len, sampling='top_h', temp=0.5)
+    print(f"\nGenerated (top-h, temp=0.5):\n{output}")
+
 # ============= EXAMPLE USAGE =============
 
 if __name__ == "__main__":
@@ -1589,6 +1950,12 @@ CORIOLANUS:
     print(f"Decoded: {decoded}")
     print(f"Decoded length: {len(decoded)}")
     print(f"Match: {'✓' if input_text == decoded else '✗'}")
+
+    model = load_model("xor_model", "mps")
+
+    run_test_generations(model, "The world is a cold place.", max_len=512)
+
+    exit()
 
     test_run = True
 
