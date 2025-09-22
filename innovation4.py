@@ -26,49 +26,144 @@ import wandb
 torch.set_float32_matmul_precision('high')
 
 
-def partition_heads_golden(n_heads, n_groups):
+# ============= INITIALIZATION UTILITIES =============
+
+def _init_weights_standard(module, std=0.02, mean=0.0):
+    """Unified weight initialization for all module types."""
+    if isinstance(module, nn.Linear):
+        torch.nn.init.normal_(module.weight, mean=mean, std=std)
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+    elif hasattr(module, 'scale'):  # RMSNorm
+        nn.init.ones_(module.scale)
+        if hasattr(module, 'shift') and module.shift is not None:
+            nn.init.zeros_(module.shift)
+    # Tau parameters are handled in their respective modules
+
+
+class LRUCache:
+    """Simple LRU cache with optional device-aware tensor handling.
+
+    - capacity: max number of items to keep
+    - move_tensors_to_device: when True, tensors are moved to the requested device on hit
     """
-    Partition heads into groups using Golden ratio proportions.
+    def __init__(self, capacity: int = 64, move_tensors_to_device: bool = True):
+        from collections import OrderedDict
+        self.capacity = int(max(1, capacity))
+        self.move_tensors_to_device = bool(move_tensors_to_device)
+        self._store = OrderedDict()
 
-    Args:
-        n_heads: Number of heads to partition
-        n_groups: Number of groups to create
+    def get(self, key, factory=None, device: torch.device | None = None):
+        store = self._store
+        if key in store:
+            val = store.pop(key)
+            # Move to end as MRU
+            store[key] = val
+            # Optionally move tensors to requested device
+            if self.move_tensors_to_device and device is not None and isinstance(val, torch.Tensor):
+                if val.device != device:
+                    val = val.to(device)
+                    store[key] = val
+            return val
+        # Miss
+        if factory is None:
+            raise KeyError(f"LRUCache miss for key={key} and no factory provided")
+        val = factory()
+        store[key] = val
+        # Evict LRU if over capacity
+        if len(store) > self.capacity:
+            store.popitem(last=False)
+        return val
 
-    Returns:
-        List of head index groups
+
+class SamplingStrategy:
+    """Unified, numerically-stable sampling for top-p and top-h.
+
+    Usage: next_token = sampler.sample(last_logits, sampling='top_p', top_p=0.9, alpha=0.4)
+    - last_logits: [B, V]
+    - Returns: [B, 1] sampled token ids
     """
-    if n_groups == 1:
-        return [list(range(n_heads))]
+    def __init__(self):
+        pass
 
-    φ = (1 + np.sqrt(5)) / 2
+    @staticmethod
+    def _entropy_from_probs(probs: torch.Tensor) -> torch.Tensor:
+        # probs: [..., V]
+        eps = 1e-10
+        p = torch.clamp(probs, min=eps)
+        return -(p * torch.log(p)).sum(dim=-1)
 
-    # Create golden-ratio weighted partitions (largest-remainder method)
-    weights = np.array([φ ** (n_groups - 1 - i) for i in range(n_groups)], dtype=np.float64)
-    weights = weights / weights.sum()
+    def _apply_top_h(self, sorted_logits: torch.Tensor, sorted_idx: torch.Tensor, alpha: float = 0.4) -> torch.Tensor:
+        """Return boolean keep_mask for tokens to keep based on entropy threshold.
+        sorted_logits/sorted_idx: [B, V]
+        """
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        full_entropy = self._entropy_from_probs(sorted_probs)  # [B]
+        threshold = alpha * full_entropy  # [B]
 
-    raw = weights * n_heads
-    floor_sizes = np.floor(raw).astype(int)
-    remainder = raw - floor_sizes
+        B, V = sorted_probs.shape
+        keep_mask = torch.zeros(B, V, dtype=torch.bool, device=sorted_probs.device)
+        keep_mask[:, 0] = True
 
-    # Distribute remaining heads to groups with largest fractional parts
-    remaining = int(n_heads - floor_sizes.sum())
-    if remaining > 0:
-        idx = np.argsort(-remainder)
-        floor_sizes[idx[:remaining]] += 1
+        # Iteratively include up to top-100 tokens or until entropy threshold is crossed
+        max_scan = min(100, V)
+        for i in range(1, max_scan):
+            p_i = sorted_probs[:, i]
+            if (p_i < 1e-10).all():
+                break
+            keep_mask[:, i] = True
+            # Compute entropy of current subset per batch
+            # Build masked distribution per batch (normalize)
+            masked = torch.where(keep_mask, sorted_probs, torch.zeros_like(sorted_probs))
+            denom = masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            sub_probs = masked / denom
+            sub_entropy = self._entropy_from_probs(sub_probs)  # [B]
+            # Where we exceeded threshold, revoke this token
+            revoke = sub_entropy > threshold
+            if revoke.any():
+                keep_mask[revoke, i] = False
+                # Stop adding more for those batches; continue scanning others
+                # We can't easily short-circuit per-batch here; acceptable overhead for small max_scan
+        return keep_mask
 
-    sizes = floor_sizes
+    @torch.no_grad()
+    def sample(self, last_logits: torch.Tensor, sampling: str = 'top_p', top_p: float = 0.9, alpha: float = 0.4,
+               debug: bool = False) -> torch.Tensor:
+        """Sample next token ids from last_logits using specified strategy.
+        Returns tensor of shape [B, 1]
+        """
+        # Numerical safety for non-finite
+        logits = torch.where(torch.isfinite(last_logits), last_logits, torch.full_like(last_logits, -1e10))
 
-    # Create head index groups
-    groups = []
-    start = 0
-    for size in sizes:
-        if size > 0:  # Only add non-empty groups
-            groups.append(list(range(start, start + size)))
-            start += size
+        # Sort once
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        sorted_logits = torch.where(torch.isfinite(sorted_logits), sorted_logits, torch.full_like(sorted_logits, -1e10))
 
-    return groups
+        # Strategy
+        if sampling == 'top_h':
+            keep_mask = self._apply_top_h(sorted_logits, sorted_idx, alpha=alpha)
+        else:  # top_p
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumsum = torch.cumsum(sorted_probs, dim=-1)
+            keep_mask = cumsum <= top_p
+            keep_mask[:, 0] = True
 
-# Even more concise version using vectorization
+        # Apply mask and build probabilities
+        filtered_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -float('inf')))
+        probs = F.softmax(filtered_logits, dim=-1)
+
+        # Validate distribution
+        if (torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any() or (probs.sum(dim=-1) == 0).any()):
+            # Fallback: uniform over bytes + small EOS mass is handled by caller when needed
+            # Here, just do argmax as a safe fallback
+            next_sorted = torch.argmax(sorted_logits, dim=-1, keepdim=True)
+            next_token = sorted_idx.gather(-1, next_sorted)
+            return next_token
+
+        next_token_sorted = torch.multinomial(probs, 1)
+        next_token = sorted_idx.gather(-1, next_token_sorted)
+        return next_token
+
 def golden_groups(n_layers, n_heads=8, min_group_size=1, max_group_size=3):
     """Golden grouping with bounded group sizes for all layers.
 
@@ -88,39 +183,29 @@ def golden_groups(n_layers, n_heads=8, min_group_size=1, max_group_size=3):
     max_gs = int(max(1, max_group_size))
     if min_gs > max_gs:
         min_gs, max_gs = max_gs, min_gs
+    k = int(np.ceil(n_heads / max_gs))
 
-    k_min = int(np.ceil(n_heads / max_gs))
-    k_max = int(max(1, n_heads // min_gs))
-    if k_min > k_max:
-        # Infeasible constraints; relax by increasing k to k_min and letting some groups be size > min_gs
-        k = k_min
-    else:
-        k = k_min
-
-    # Base golden weights for k groups (largest first)
+    # Generate normalized golden ratio weights for k groups
     j = np.arange(k, dtype=np.float64)
-    base_weights = φ ** (-j)
-    base_weights = base_weights / base_weights.sum()
+    weights = φ ** (-j)
+    weights = weights / weights.sum()
 
-    # Compute a single canonical size vector within [min_gs, max_gs]
+    # Allocate head sizes using largest-remainder method with capacity constraints
     base_sizes = np.full(k, min_gs, dtype=int)
     remaining = int(n_heads - base_sizes.sum())
     capacities = np.full(k, max_gs - min_gs, dtype=int)
-    if remaining < 0:
-        # Should not happen with k = ceil(n_heads / max_gs), but guard
-        raise ValueError("Invalid group size constraints relative to n_heads")
 
     if remaining > 0:
         # Largest-remainder allocation within capacities
-        raw_add = base_weights * remaining
+        raw_add = weights * remaining
         add_floor = np.floor(raw_add).astype(int)
-        # Respect capacities
         add_floor = np.minimum(add_floor, capacities)
         sizes = base_sizes + add_floor
+
+        # Handle remainders
         leftover = remaining - add_floor.sum()
         if leftover > 0:
             rema = raw_add - add_floor
-            # Assign remaining heads by descending fractional remainder, honoring capacity
             order = np.argsort(-rema)
             for idx in order:
                 if leftover == 0:
@@ -128,37 +213,38 @@ def golden_groups(n_layers, n_heads=8, min_group_size=1, max_group_size=3):
                 if sizes[idx] - base_sizes[idx] < capacities[idx]:
                     sizes[idx] += 1
                     leftover -= 1
-        else:
-            sizes = base_sizes
     else:
         sizes = base_sizes
 
-    # Defensive clamp and final adjustment if rounding drifted
+    # Adjust sizes to exactly sum to n_heads while respecting bounds
     sizes = np.clip(sizes, min_gs, max_gs)
     diff = int(n_heads - sizes.sum())
     if diff != 0:
-        # Add/subtract heads starting from largest-remainder preference while respecting bounds
         direction = 1 if diff > 0 else -1
         steps = abs(diff)
-        # Use remainders to guide distribution; if not available, use golden order
-        rema = (base_weights * n_heads) - np.floor(base_weights * n_heads)
+        # Use remainders to guide distribution
+        rema = (weights * n_heads) - np.floor(weights * n_heads)
         order = np.argsort(-rema) if direction > 0 else np.argsort(rema)
+
         for _ in range(steps):
             for idx in order:
                 if direction > 0 and sizes[idx] < max_gs:
                     sizes[idx] += 1
                     break
-                if direction < 0 and sizes[idx] > min_gs:
+                elif direction < 0 and sizes[idx] > min_gs:
                     sizes[idx] -= 1
                     break
 
     # Build per-layer groups by permuting size order using φ-phase
     groups_per_layer = []
+    head_ring = np.arange(n_heads, dtype=int)
+
     for i in range(n_layers):
+        # Permute sizes across layers using golden ratio phase
         phase = (i * golden_conjugate) % 1.0
         positions = np.arange(len(sizes), dtype=np.float64)
         keys = np.mod(positions * golden_conjugate + phase, 1.0)
-        pos_order = np.argsort(keys)  # ascending keys define placement order
+        pos_order = np.argsort(keys)
 
         # Place sizes (largest first) into permuted positions
         sizes_sorted = np.sort(sizes)[::-1]
@@ -167,7 +253,6 @@ def golden_groups(n_layers, n_heads=8, min_group_size=1, max_group_size=3):
             sized_positions[pos] = sizes_sorted[rank]
 
         # Form contiguous groups anchored at head index 0
-        head_ring = np.arange(n_heads, dtype=int)
         groups = []
         start = 0
         for sz in sized_positions:
@@ -426,16 +511,14 @@ class AsymGQATransformerBlock(nn.Module):
         # Positional alpha per head
         self.tau_alpha = nn.Parameter(torch.zeros(self.n_heads))
 
+        # Initialize tau gating parameters
         nn.init.normal_(self.tau_wq, std=0.02)
         nn.init.normal_(self.tau_wv_kv, std=0.02)
         nn.init.zeros_(self.tau_alpha)
 
-        # Small LRU cache for position logs per device and sequence length
-        self._poslog_cache_lru = None
-        self._poslog_cache_max = 64
-        self._pos_log_cache = {}
-        self._alpha_sigmoid_cache = None
-        self._max_cache_entries = 32  # Limit cache size
+        # LRU cache for position logs per (device, seq_len)
+        # Implemented via shared LRUCache utility
+        self.poslog_cache = LRUCache(capacity=64, move_tensors_to_device=True)
 
         if not hasattr(self, '_kv_map_expanded'):
             self.register_buffer('_kv_map_expanded', self.kv_map.view(1, 1, -1))
@@ -450,27 +533,12 @@ class AsymGQATransformerBlock(nn.Module):
                 self.register_buffer('_group_agg_wv_cached', self._group_agg_wv)
 
     def _get_pos_log_cached(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Return cached log1p(arange(L)) [L] float32 on device."""
-        if self._poslog_cache_lru is None:
-            from collections import OrderedDict
-            self._poslog_cache_lru = OrderedDict()
-
+        """Return cached log1p(arange(L)) [L] float32 on device (LRU)."""
         key = (str(device), int(seq_len))
-        cache = self._poslog_cache_lru
-        if key in cache:
-            val = cache.pop(key)
-            cache[key] = val
-            if val.device != device:
-                val = val.to(device)
-                cache[key] = val
-            return val
-        # Miss → create
-        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
-        val = torch.log1p(pos)
-        cache[key] = val
-        if len(cache) > self._poslog_cache_max:
-            cache.popitem(last=False)
-        return val
+        def _factory():
+            pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+            return torch.log1p(pos)
+        return self.poslog_cache.get(key, factory=_factory, device=device)
 
     def _create_kv_map(self):
         """Create index mapping from Q heads to KV heads"""
@@ -743,9 +811,6 @@ class XOR8BitLM(nn.Module):
         # Bit projection: 8 bits -> d_model
         self.bit_proj = nn.Linear(8, d_model, dtype=dtype)
 
-        # Single learnable register embedding (additive bias)
-        self.register_bias = nn.Parameter(torch.zeros(d_model))
-
         # Optional offset-aware register embeddings (index 0 reserved for non-register)
         if self.mutor_dmax > 0:
             self.offset_embeddings = nn.Embedding(self.mutor_dmax + 1, d_model, dtype=dtype)
@@ -775,13 +840,11 @@ class XOR8BitLM(nn.Module):
         self.out = nn.Linear(d_model, len(self.encoder), dtype=dtype)
 
         # Initialize weights
-        self.apply(self._init_weights)
+        self.apply(_init_weights_standard)
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+        # Shared LRU cache for causal masks per (device, L)
+        self._causal_mask_cache = LRUCache(capacity=64, move_tensors_to_device=True)
+
 
     def _init_offset_embeddings(self):
         """Initialize offset embeddings with Gray code-inspired pattern; index 0 is zero."""
@@ -801,185 +864,93 @@ class XOR8BitLM(nn.Module):
         return gray_code_lut_apply(x, self.bit_lut)
 
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Return cached upper-triangular causal mask of shape [L, L] (bool) using small LRU."""
-        # LRU implemented with OrderedDict semantics
-        if not hasattr(self, '_causal_masks_lru'):
-            from collections import OrderedDict
-            self._causal_masks_lru = OrderedDict()
-            self._causal_masks_max = 64
-
+        """Return cached upper-triangular causal mask of shape [L, L] (bool) using shared LRU."""
         key = (str(device), int(seq_len))
-        cache = self._causal_masks_lru
-
-        if key in cache:
-            mask = cache.pop(key)
-            # Refresh position to mark as most-recently-used
-            cache[key] = mask
-            # Move to device if needed (rare path)
-            if mask.device != device:
-                mask = mask.to(device)
-                cache[key] = mask
-            return mask
-
-        # Miss → create
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), 1)
-        cache[key] = mask
-        # Evict least-recently-used if beyond capacity
-        if len(cache) > self._causal_masks_max:
-            cache.popitem(last=False)
-        return mask
+        def _factory():
+            return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), 1)
+        return self._causal_mask_cache.get(key, factory=_factory, device=device)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None,
-                is_register: torch.Tensor | None = None) -> torch.Tensor:
-        """Forward pass with optional MuToR positions/registers support."""
+                register_offsets: torch.Tensor | None = None,
+                return_cache: bool = False, past_kv: Optional[List[tuple[torch.Tensor, torch.Tensor]]] = None) -> Union[torch.Tensor, tuple[torch.Tensor, List]]:
+        """Unified forward pass supporting all modes.
+
+        Args:
+            x: [B, L] token ids
+            positions: [B, L] float32 or None for RoPE
+            register_offsets: [B, L] int64 for sparse MuToR offsets
+            return_cache: if True, return (logits, new_past_kv) for KV-cache
+            past_kv: list of (k, v) per layer for incremental generation
+
+        Returns:
+            logits [B, L, V] or (logits, new_past_kv) if return_cache=True
+        """
         B, L = x.shape
 
         if (x == self.encoder.PAD).all():
-            return torch.zeros(B, L, len(self.encoder), device=x.device, dtype=self.param_dtype)
+            empty_logits = torch.zeros(B, L, len(self.encoder), device=x.device, dtype=self.param_dtype)
+            return empty_logits if not return_cache else (empty_logits, [])
 
         # Convert to bits and project
         bits = self.to_bits(x)
         h = self.bit_proj(bits)
 
-        # Add register bias where applicable
-        if is_register is not None:
-            h = h + self.register_bias.to(h.dtype) * is_register.unsqueeze(-1).to(h.dtype)
-
-        # Build attention mask (normalize shapes in blocks)
-        if is_register is None:
-            mask = self._get_causal_mask(L, x.device)  # [L, L]
-        else:
-            base_mask = self._get_causal_mask(L, x.device)
-            register_mask = is_register.unsqueeze(1).expand(-1, L, -1)  # [B, L, L]
-            mask = base_mask.unsqueeze(0) | register_mask  # [B, L, L]
-
-        # Key padding mask: True where token is PAD
-        key_padding_mask = (x == self.encoder.PAD)
-
-        # Apply transformer layers
-        for layer in self.layers:
-            h = layer(h, mask, key_padding_mask, positions=positions)
-
-        # Final norm and output
-        h = self.norm(h)
-        return self.out(h)
-
-    def forward_mutor_sparse(self, x: torch.Tensor, register_offsets: torch.Tensor | None = None) -> torch.Tensor:
-        """Single-stream sparse MuToR forward.
-        - x: [B, L] token ids
-        - register_offsets: [B, L] int64, 0 for non-register, 1..dmax for register positions
-        """
-        B, L = x.shape
-
-        # Bit projection
-        bits = self.to_bits(x)
-        h = self.bit_proj(bits)
-
-        # Add offset embeddings where provided
-        if register_offsets is not None and hasattr(self, 'offset_embeddings'):
+        if register_offsets is not None:
+            # Sparse MuToR with offset embeddings
             if register_offsets.dtype != torch.long:
                 register_offsets = register_offsets.to(torch.long)
             h = h + self.offset_embeddings(register_offsets)
 
-        # Standard causal mask
-        mask = self._get_causal_mask(L, x.device)
+        mask = self._get_causal_mask(L, x.device) if not return_cache else None
+
         key_padding_mask = (x == self.encoder.PAD)
 
-        # Transformer stack
-        for layer in self.layers:
-            h = layer(h, mask, key_padding_mask, positions=None)
+        # Forward through layers
+        new_past = []
+        if return_cache:
+            # KV-cache mode
+            use_incremental = past_kv is not None and L == 1
+            if not use_incremental:
+                for layer in self.layers:
+                    h, k_present, v_present = layer.full_pass_return_kv(h, mask, key_padding_mask, positions=positions)
+                    new_past.append((k_present, v_present))
+            else:
+                assert positions is not None, "positions required for incremental generation"
+                for i, layer in enumerate(self.layers):
+                    k_prev, v_prev = past_kv[i]
+                    h, k_all, v_all = layer.forward_incremental(h, positions, k_prev, v_prev)
+                    new_past.append((k_all, v_all))
+        else:
+            # Standard forward
+            for layer in self.layers:
+                h = layer(h, mask, key_padding_mask, positions=positions)
 
+        # Final norm and output
         h = self.norm(h)
-        return self.out(h)
+        logits = self.out(h)
+
+        return (logits, new_past) if return_cache else logits
+
+    def forward_mutor_sparse(self, x: torch.Tensor, register_offsets: torch.Tensor | None = None) -> torch.Tensor:
+        """Single-stream sparse MuToR forward - delegates to unified forward."""
+        return self.forward(x, register_offsets=register_offsets)
 
     @torch.no_grad()
     def forward_with_cache(self, x: torch.Tensor, positions: torch.Tensor | None = None,
-                           is_register: torch.Tensor | None = None,
                            past_kv: Optional[List[tuple[torch.Tensor, torch.Tensor]]] = None):
-        """Forward that supports KV-cache for incremental generation.
-        x: [B, T]
-        positions: [B, T] float32 or None
-        past_kv: list of (k, v) per layer or None; k/v shapes [B, H, S, head_dim]
-        Returns: logits [B, T, V], new_past_kv
-        """
-        self.eval()
-        B, T = x.shape
+        """KV-cache aware forward - delegates to unified forward."""
+        return self.forward(x, positions=positions, return_cache=True, past_kv=past_kv)
 
-        bits = self.to_bits(x)
-        h = self.bit_proj(bits)
-
-        if is_register is not None:
-            h = h + self.register_bias.to(h.dtype) * is_register.unsqueeze(-1).to(h.dtype)
-
-        # Mask: causal only for generation; MuToR masking not used in generation
-        mask = None
-
-        new_past: List[tuple[torch.Tensor, torch.Tensor]] = []
-        use_incremental = past_kv is not None and T == 1
-
-        if not use_incremental:
-            # Full pass build and collect K/V
-            for i, layer in enumerate(self.layers):
-                h, k_present, v_present = layer.full_pass_return_kv(h, mask, None, positions=positions)
-                new_past.append((k_present, v_present))
-        else:
-            # Incremental
-            assert positions is not None, "positions must be provided for incremental generation"
-            for i, layer in enumerate(self.layers):
-                k_prev, v_prev = past_kv[i]
-                h, k_all, v_all = layer.forward_incremental(h, positions_last=positions, past_k=k_prev, past_v=v_prev)
-                new_past.append((k_all, v_all))
-
-        h = self.norm(h)
-        logits = self.out(h)
-        return logits, new_past
-
-    def _compute_entropy(self, probs):
-        """Vectorized entropy computation."""
-        # Avoid loops and item() calls
-        mask = probs > 1e-10
-        if not mask.any():
-            return torch.tensor(0.0)
-
-        p_valid = probs[mask]
-        # Use torch operations instead of item()
-        entropy = -(p_valid * torch.log(p_valid)).sum()
-        return entropy  # Keep as tensor until needed
-
-    def _apply_top_h(self, sorted_logits, sorted_idx, alpha=0.4):
-        """Apply Top-H filtering to already-sorted logits.
-        Returns mask for tokens to keep."""
-
-        # Get probabilities from sorted logits
-        sorted_probs = F.softmax(sorted_logits, dim=-1)
-
-        # Compute full distribution entropy (for threshold)
-        full_entropy = self._compute_entropy(sorted_probs)
-        threshold = alpha * full_entropy
-
-        # Build subset iteratively, tracking entropy
-        keep_mask = torch.zeros_like(sorted_probs, dtype=torch.bool)
-        keep_mask[..., 0] = True  # Always keep top token
-
-        for i in range(1, min(100, sorted_probs.shape[-1])):  # Limit search to top-100 for speed
-            if sorted_probs[..., i] < 1e-10:
-                break
-            keep_mask[..., i] = True
-            # Compute entropy of current subset
-            subset_probs = sorted_probs[keep_mask]
-            subset_probs = subset_probs / subset_probs.sum()
-            if self._compute_entropy(subset_probs) > threshold:
-                keep_mask[..., i] = False  # Remove last token
-                break
-
-        return keep_mask
 
     @torch.no_grad()
-    def generate_with_cache(self, prompt="", max_len=100, temp=1.0, sampling='top_p', top_p=0.9, alpha=0.4, debug=False, apply_chat_template=False):
-        """Generation with KV-cache optimized for MPS/CPU. Supports top-p and top-h sampling."""
+    def generate(self, prompt="", max_len=100, temp=1.0, sampling='top_p', top_p=0.9, alpha=0.4,
+                 debug=False, apply_chat_template=False, use_cache=True):
+        """Unified generation with optional KV-cache. Supports top-p and top-h sampling."""
         self.eval()
         device = next(self.parameters()).device
+        sampler = SamplingStrategy()
 
+        # Prepare input sequence
         if apply_chat_template:
             system_preface = "You are Kulles, created by Rasmus. You are a helpful assistant."
             base_segs = [
@@ -1000,216 +971,102 @@ class XOR8BitLM(nn.Module):
             seq = seq[:-1]
         x = torch.from_numpy(seq).long().unsqueeze(0).to(device)
 
-        past_kv = None
-        # Running absolute positions for RoPE/tau
-        cur_len = x.size(1)
-        pos = torch.arange(cur_len, device=device, dtype=torch.float32).unsqueeze(0)
+        if not use_cache:
+            # Simple generation without cache
+            for _ in range(max_len):
+                if x.size(1) > self.rope.max_seq_len:
+                    x = x[:, -self.rope.max_seq_len:]
 
-        # Prime cache with initial context
-        logits, past_kv = self.forward_with_cache(x, positions=pos, is_register=None, past_kv=None)
+                logits = self(x)[:, -1, :] / max(temp, 1e-6)
+                next_token = self._sample_next_token(logits, sampler, sampling, top_p, alpha, debug)
 
-        # Pre-allocate cache for maximum sequence length
-        max_cache_len = min(cur_len + max_len, self.rope.max_seq_len)
-        pre_allocated_kv = []
-        for k, v in past_kv:
-            # Allocate full-size tensors
-            k_cache = torch.zeros(k.size(0), k.size(1), max_cache_len, k.size(3),
-                                device=device, dtype=k.dtype)
-            v_cache = torch.zeros(v.size(0), v.size(1), max_cache_len, v.size(3),
-                                device=device, dtype=v.dtype)
-            # Copy initial context
-            k_cache[:, :, :cur_len] = k
-            v_cache[:, :, :cur_len] = v
-            pre_allocated_kv.append((k_cache, v_cache))
+                if next_token.item() == self.encoder.EOS:
+                    break
+                x = torch.cat([x, next_token], dim=1)
+        else:
+            # Cached generation
+            cur_len = x.size(1)
+            pos = torch.arange(cur_len, device=device, dtype=torch.float32).unsqueeze(0)
+            logits, past_kv = self.forward_with_cache(x, positions=pos, past_kv=None)
 
-        for _ in range(max_len):
-            # Stop if cache is full to avoid overflow writes
-            if cur_len >= max_cache_len:
+            # Pre-allocate KV up to cap
+            max_cache_len = min(cur_len + max_len, self.rope.max_seq_len)
+            pre_allocated_kv = []
+            for k, v in past_kv:
+                k_cache = torch.zeros(k.size(0), k.size(1), max_cache_len, k.size(3), device=device, dtype=k.dtype)
+                v_cache = torch.zeros(v.size(0), v.size(1), max_cache_len, v.size(3), device=device, dtype=v.dtype)
+                k_cache[:, :, :cur_len] = k
+                v_cache[:, :, :cur_len] = v
+                pre_allocated_kv.append((k_cache, v_cache))
+
+            for _ in range(max_len):
+                if cur_len >= max_cache_len:
+                    if debug:
+                        print(f"[gen-cache] reached max_cache_len={max_cache_len}; stopping")
+                    break
+
+                last_logits = logits[:, -1, :] / max(temp, 1e-6)
+                next_token = self._sample_next_token(last_logits, sampler, sampling, top_p, alpha, debug)
+
+                if next_token.item() == self.encoder.EOS:
+                    break
+
+                # Update seq and cache step
+                x_next = next_token
+                x = torch.cat([x, x_next], dim=1)
+                cur_len += 1
+                pos_next = torch.tensor([[cur_len - 1]], device=device, dtype=torch.float32)
+
+                current_kv = [(k[:, :, :cur_len-1], v[:, :, :cur_len-1]) for k, v in pre_allocated_kv]
+                logits, new_kv = self.forward_with_cache(x_next, positions=pos_next, past_kv=current_kv)
+
+                if cur_len < max_cache_len:
+                    for i, (k_new, v_new) in enumerate(new_kv):
+                        pre_allocated_kv[i][0][:, :, cur_len-1:cur_len] = k_new[:, :, -1:]
+                        pre_allocated_kv[i][1][:, :, cur_len-1:cur_len] = v_new[:, :, -1:]
+                else:
+                    if debug:
+                        print(f"[gen-cache] reached max_cache_len={max_cache_len}")
+                    break
+
                 if debug:
-                    print(f"[gen-cache] reached max_cache_len={max_cache_len}; stopping to avoid cache overflow")
-                break
-
-            # Last token logits
-            last_logits = logits[:, -1, :] / temp
-            last_logits[..., self.encoder.START] = -float('inf')
-            last_logits[..., self.encoder.PAD] = -float('inf')
-            last_logits[..., self.encoder.REGISTER] = -float('inf')
-            # Avoid sampling instruction boundary tokens during free generation
-            if hasattr(self.encoder, 'IM_START'):
-                last_logits[..., self.encoder.IM_START] = -float('inf')
-            if hasattr(self.encoder, 'IM_END'):
-                last_logits[..., self.encoder.IM_END] = -float('inf')
-
-            if not torch.isfinite(last_logits).any():
-                last_logits = torch.zeros_like(last_logits)
-                last_logits[..., :256] = 1.0
-                last_logits[..., self.encoder.EOS] = 1.0
-                last_logits[..., self.encoder.START] = -float('inf')
-                last_logits[..., self.encoder.PAD] = -float('inf')
-                last_logits[..., self.encoder.REGISTER] = -float('inf')
-                if debug:
-                    print("[gen-cache] fallback logits")
-
-            # Sort logits once
-            sorted_logits, sorted_idx = torch.sort(last_logits, descending=True)
-            sorted_logits = torch.where(
-                torch.isfinite(sorted_logits), sorted_logits, torch.full_like(sorted_logits, -1e10)
-            )
-
-            # Apply sampling method
-            if sampling == 'top_h':
-                keep_mask = self._apply_top_h(sorted_logits, sorted_idx, alpha)
-            else:  # top_p
-                sorted_probs = F.softmax(sorted_logits, dim=-1)
-                cumsum = torch.cumsum(sorted_probs, dim=-1)
-                keep_mask = cumsum <= top_p
-                keep_mask[..., 0] = True
-
-            # Apply mask and get final probabilities
-            sorted_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -float('inf')))
-            probs = F.softmax(sorted_logits, dim=-1)
-
-            # Check for valid probabilities and sample
-            if not torch.isfinite(probs).all() or (probs < 0).any() or probs.sum() == 0:
-                probs = torch.zeros_like(last_logits)
-                probs[..., :256] = 1.0 / 256
-                probs[..., self.encoder.EOS] = 0.01
-                probs = probs / probs.sum(dim=-1, keepdim=True)
-                next_token = torch.multinomial(probs, 1)
-                if debug:
-                    print("[gen-cache] fallback probs")
-            else:
-                next_token_sorted = torch.multinomial(probs, 1)
-                next_token = sorted_idx.gather(-1, next_token_sorted)
-
-            if next_token.item() == self.encoder.EOS:
-                break
-
-            # Update sequence and run incremental step
-            x_next = next_token
-            x = torch.cat([x, x_next], dim=1)
-            cur_len += 1
-            pos_next = torch.tensor([[cur_len - 1]], device=device, dtype=torch.float32)
-
-            # Pass sliced cache
-            current_kv = [(k[:, :, :cur_len-1], v[:, :, :cur_len-1]) for k, v in pre_allocated_kv]
-            logits, new_kv = self.forward_with_cache(x_next, positions=pos_next, is_register=None, past_kv=current_kv)
-
-            # Update only the last step in the pre-allocated cache (avoid O(L) copy)
-            if cur_len >= max_cache_len:
-                print(f"[gen-cache] reached max_cache_len={max_cache_len}")
-                break
-
-            # Update only if within bounds
-            if cur_len < max_cache_len:
-                for i, (k_new, v_new) in enumerate(new_kv):
-                    pre_allocated_kv[i][0][:, :, cur_len-1:cur_len] = k_new[:, :, -1:]
-                    pre_allocated_kv[i][1][:, :, cur_len-1:cur_len] = v_new[:, :, -1:]
-
-            if debug:
-                last_tokens = x[0, -4:].tolist() if x.size(1) >= 4 else x[0].tolist()
-                token_id = next_token.item()
-                special = 'EOS' if token_id == self.encoder.EOS else (
-                    'START' if token_id == self.encoder.START else (
-                    'PAD' if token_id == self.encoder.PAD else ''))
-                print(f"[gen-cache] last={last_tokens} -> next={token_id}{'('+special+')' if special else ''}")
+                    last_tokens = x[0, -4:].tolist() if x.size(1) >= 4 else x[0].tolist()
+                    token_id = next_token.item()
+                    special = 'EOS' if token_id == self.encoder.EOS else ('START' if token_id == self.encoder.START else ('PAD' if token_id == self.encoder.PAD else ''))
+                    print(f"[gen-cache] last={last_tokens} -> next={token_id}{'('+special+')' if special else ''}")
 
         return self.encoder.decode(x[0].cpu().numpy())
 
-    @torch.no_grad()
-    def generate(self, prompt="", max_len=100, temp=1.0, top_p=0.9, debug=False):
-        """Fast generation with top-p sampling - Fixed for numerical stability."""
-        self.eval()
-        device = next(self.parameters()).device
+    def _sample_next_token(self, logits, sampler, sampling, top_p, alpha, debug):
+        """Helper to sample next token with special token masking and fallback."""
+        # Mask specials
+        logits[..., self.encoder.START] = -float('inf')
+        logits[..., self.encoder.PAD] = -float('inf')
+        logits[..., self.encoder.REGISTER] = -float('inf')
+        if hasattr(self.encoder, 'IM_START'):
+            logits[..., self.encoder.IM_START] = -float('inf')
+        if hasattr(self.encoder, 'IM_END'):
+            logits[..., self.encoder.IM_END] = -float('inf')
 
-        # Encode prompt
-        seq = self.encoder.encode(prompt)
-        # Remove trailing EOS to allow continuation
-        if len(seq) > 0 and seq[-1] == self.encoder.EOS:
-            seq = seq[:-1]
-        x = torch.from_numpy(seq).long().unsqueeze(0).to(device)
-
-        for _ in range(max_len):
-            # Crop context if it exceeds max length
-            if x.size(1) > self.rope.max_seq_len:
-                x = x[:, -self.rope.max_seq_len:]
-
-            # Get logits
-            logits = self(x)[:, -1, :] / temp
-
-            # Prevent sampling of START, PAD, and REGISTER tokens
+        if not torch.isfinite(logits).any():
+            if debug:
+                print("[gen] fallback logits")
+            logits = torch.zeros_like(logits)
+            logits[..., :256] = 1.0
+            logits[..., self.encoder.EOS] = 1.0
             logits[..., self.encoder.START] = -float('inf')
             logits[..., self.encoder.PAD] = -float('inf')
             logits[..., self.encoder.REGISTER] = -float('inf')
-            # Avoid sampling instruction boundary tokens during free generation
-            if hasattr(self.encoder, 'IM_START'):
-                logits[..., self.encoder.IM_START] = -float('inf')
-            if hasattr(self.encoder, 'IM_END'):
-                logits[..., self.encoder.IM_END] = -float('inf')
 
-            # Check if we have any valid logits
-            if not torch.isfinite(logits).any():
-                # Emergency fallback: allow all byte values
-                logits = torch.zeros_like(logits)
-                logits[..., :256] = 1.0  # Equal probability for all bytes
-                logits[..., self.encoder.EOS] = 1.0  # Allow EOS
-                logits[..., self.encoder.START] = -float('inf')
-                logits[..., self.encoder.PAD] = -float('inf')
-                logits[..., self.encoder.REGISTER] = -float('inf')
-                if debug:
-                    print("[gen] fallback logits -> uniform over bytes + EOS; masked START/PAD")
+        next_token = sampler.sample(logits, sampling=sampling, top_p=top_p, alpha=alpha, debug=debug)
 
-            # Top-p sampling with numerical stability
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        if debug:
+            token_id = next_token.item()
+            special = 'EOS' if token_id == self.encoder.EOS else ('START' if token_id == self.encoder.START else ('PAD' if token_id == self.encoder.PAD else ''))
+            print(f"[gen] next={token_id}{'('+special+')' if special else ''}")
 
-            # Remove any remaining inf values
-            sorted_logits = torch.where(
-                torch.isfinite(sorted_logits),
-                sorted_logits,
-                torch.full_like(sorted_logits, -1e10)
-            )
+        return next_token
 
-            sorted_probs = F.softmax(sorted_logits, dim=-1)
-
-            # Top-p filtering (ensure at least 1 token kept)
-            cumsum = torch.cumsum(sorted_probs, dim=-1)
-            keep_mask = cumsum <= top_p
-            # Always keep the highest-prob token
-            keep_mask[..., 0] = True
-            sorted_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -float('inf')))
-
-            # Final probability distribution
-            probs = F.softmax(sorted_logits, dim=-1)
-
-            # Check for valid probabilities
-            if not torch.isfinite(probs).all() or (probs < 0).any() or probs.sum() == 0:
-                # Ultimate fallback: uniform distribution over bytes
-                probs = torch.zeros_like(logits)
-                probs[..., :256] = 1.0 / 256
-                probs[..., self.encoder.EOS] = 0.01
-                probs = probs / probs.sum(dim=-1, keepdim=True)
-                next_token = torch.multinomial(probs, 1)
-                if debug:
-                    print("[gen] fallback probs -> uniform bytes with small EOS mass")
-            else:
-                # Normal sampling
-                next_token_sorted = torch.multinomial(probs, 1)
-                next_token = sorted_idx.gather(-1, next_token_sorted)
-
-            if debug:
-                last_tokens = x[0, -4:].tolist() if x.size(1) >= 4 else x[0].tolist()
-                token_id = next_token.item()
-                special = 'EOS' if token_id == self.encoder.EOS else (
-                    'START' if token_id == self.encoder.START else (
-                    'PAD' if token_id == self.encoder.PAD else ''))
-                print(f"[gen] last={last_tokens} -> next={token_id}{'('+special+')' if special else ''}")
-
-            if next_token.item() == self.encoder.EOS:
-                break
-
-            x = torch.cat([x, next_token], dim=1)
-
-        return self.encoder.decode(x[0].cpu().numpy())
 
 # ============= TRAINING =============
 
@@ -1494,16 +1351,17 @@ class Trainer:
         self.perplexity = perplexity
         self.best_perplexity = min(self.best_perplexity, perplexity)
 
-    def train_step(self, batch: torch.Tensor, use_mutor: bool = True) -> float:
-        """Single training step with mixed precision and optional MuToR."""
-        # Support optional (tokens, loss_mask) from packed dataset v2
+    def _unpack_batch(self, batch):
+        """Unpack batch tuple (tokens, loss_mask) or return tensor directly."""
         if isinstance(batch, (list, tuple)) and len(batch) == 2:
             tokens, loss_mask = batch
-            batch = tokens.to(self.device)
-            loss_mask = loss_mask.to(self.device)
+            return tokens.to(self.device), loss_mask.to(self.device)
         else:
-            batch = batch.to(self.device)
-            loss_mask = None
+            return batch.to(self.device), None
+
+    def train_step(self, batch: torch.Tensor, use_mutor: bool = True) -> float:
+        """Single training step with mixed precision and optional MuToR."""
+        batch, loss_mask = self._unpack_batch(batch)
 
         # Prepare inputs and targets
         inputs = batch[:, :-1]
@@ -1655,13 +1513,7 @@ class Trainer:
     @torch.no_grad()
     def eval_step(self, batch: torch.Tensor) -> tuple[float, int]:
         """Single evaluation step - returns loss and valid token count."""
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            tokens, loss_mask = batch
-            batch = tokens.to(self.device)
-            loss_mask = loss_mask.to(self.device)
-        else:
-            batch = batch.to(self.device)
-            loss_mask = None
+        batch, loss_mask = self._unpack_batch(batch)
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
 
@@ -1964,6 +1816,347 @@ def load_model(path: Union[str, Path], device='cuda') -> XOR8BitLM:
 
 # ============= MAIN TRAINING LOOP =============
 
+class DatasetBuilder:
+    """Handles dataset and DataLoader creation for training and validation."""
+
+    def __init__(self, device: str):
+        self.device = device
+
+    def _get_dataloader_kwargs(self, for_eval: bool = False):
+        """Get device-optimized DataLoader arguments."""
+        if self.device == 'cuda':
+            workers = min(8, (os.cpu_count() or 8))
+            return dict(num_workers=workers, pin_memory=True, persistent_workers=True, prefetch_factor=4, shuffle=not for_eval)
+        elif self.device == 'mps':
+            return dict(num_workers=0, pin_memory=False, persistent_workers=False, prefetch_factor=None, shuffle=not for_eval)
+        else:
+            workers = min(4, (os.cpu_count() or 4))
+            return dict(num_workers=workers, pin_memory=False, persistent_workers=True, prefetch_factor=2, shuffle=not for_eval)
+
+    def _build_packed_dataset(self, roots: List[Union[str, Path]], seq_length: int, mixing_policy: str, mixing_weights: Optional[List[float]]):
+        """Build packed dataset from multiple roots."""
+        ds_per_root = []
+        for r in roots:
+            shard_dirs = discover_shards(str(r))
+            if not shard_dirs:
+                continue
+            shard_datasets = [
+                PackedXORShardDataset(sd, seq_length=seq_length, stride=seq_length//2, pad_id=GrayCodeEncoder.PAD)
+                for sd in shard_dirs
+            ]
+            if len(shard_datasets) == 1:
+                ds_per_root.append(shard_datasets[0])
+            else:
+                ds_per_root.append(torch.utils.data.ConcatDataset(shard_datasets))
+
+        if not ds_per_root:
+            raise ValueError("No shards found in provided packed_dirs")
+
+        if len(ds_per_root) == 1:
+            return ds_per_root[0]
+
+        return MixedPackedXORDataset(ds_per_root, policy=mixing_policy, weights=mixing_weights)
+
+    def create_datasets_and_loaders(self, data_path, val_path, packed_dirs, val_packed_dirs,
+                                   seq_length, batch_size, mixing_policy, mixing_weights):
+        """Create training and validation datasets/loaders for non-curriculum training."""
+        use_packed = False
+        train_dataset = None
+        val_dataset = None
+
+        if packed_dirs is not None and len(packed_dirs) > 0:
+            train_dataset = self._build_packed_dataset([str(p) for p in packed_dirs], seq_length, mixing_policy, mixing_weights)
+            use_packed = True
+            print(f"Using packed datasets for training. policy={mixing_policy}, weights={mixing_weights}")
+        else:
+            # Auto-detect packed shards under data_path directory
+            dp = Path(data_path)
+            if dp.is_dir():
+                shard_dirs = discover_shards(str(dp))
+                if shard_dirs:
+                    train_dataset = self._build_packed_dataset([dp], seq_length, mixing_policy, mixing_weights)
+                    use_packed = True
+                    print(f"Auto-detected packed shards under {dp}")
+
+        if train_dataset is None:
+            # Fallback to simple text dataset
+            train_dataset = XORDataset(data_path, seq_length)
+
+        train_loader = DataLoader(train_dataset, batch_size, **self._get_dataloader_kwargs(for_eval=False))
+
+        # Validation dataset
+        if val_packed_dirs is not None and len(val_packed_dirs) > 0:
+            val_dataset = self._build_packed_dataset([str(p) for p in val_packed_dirs], seq_length, mixing_policy, mixing_weights)
+        elif val_path is not None:
+            vp = Path(val_path)
+            if vp.is_dir() and discover_shards(str(vp)):
+                val_dataset = self._build_packed_dataset([vp], seq_length, mixing_policy, mixing_weights)
+            else:
+                val_dataset = XORDataset(val_path, seq_length)
+        else:
+            if use_packed:
+                # Heuristic: reuse train roots for eval with full-stride windows (no shuffle in loader)
+                if packed_dirs is not None and len(packed_dirs) > 0:
+                    val_dataset = self._build_packed_dataset([str(p) for p in packed_dirs], seq_length, mixing_policy, mixing_weights)
+                else:
+                    val_dataset = self._build_packed_dataset([dp], seq_length, mixing_policy, mixing_weights)
+            else:
+                # Use 10% of training data with different stride for pseudo-validation
+                val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
+
+        val_loader = DataLoader(val_dataset, batch_size, **self._get_dataloader_kwargs(for_eval=True))
+
+        return train_loader, val_loader
+
+    def create_curriculum_datasets_and_loaders(self, curriculum_stage: Dict[str, Any], seq_length: int, batch_size: int,
+                                              mixing_policy: str, mixing_weights: Optional[List[float]]):
+        """Create datasets and loaders for a curriculum stage."""
+        stage_name = curriculum_stage.get('name', 'stage')
+        stage_steps = curriculum_stage.get('steps', None)
+        roots = curriculum_stage.get('packed_roots') or curriculum_stage.get('packed_dirs') or []
+        roots = [str(p) for p in roots]
+        if not roots:
+            raise ValueError(f"Curriculum stage '{stage_name}' requires 'packed_roots' or 'packed_dirs'")
+
+        # Ensure train/val split exists (create if missing) for each dataset root
+        val_ratio = float(curriculum_stage.get('val_ratio', 0.05))
+        split_pairs = []
+        for r in roots:
+            tr_dir, va_dir = ensure_train_val_split(r, val_ratio=val_ratio, seed=42)
+            split_pairs.append((tr_dir, va_dir))
+
+        # Build mixed datasets across all roots for this stage
+        if stage_steps is not None:
+            # Estimate windows needed for training and small validation
+            # Each step consumes one batch; each batch uses `batch_size` windows
+            train_windows_needed = int(stage_steps) * int(batch_size)
+            # For validation: approximate 100 batches like quick eval upper bound
+            val_batches = 100
+            val_windows_needed = val_batches * int(batch_size)
+            print(f"[stage] {stage_name}: capping dataset selection -> train_windows~{train_windows_needed}, val_windows~{val_windows_needed}")
+            stage_train_ds = build_capped_mixed_dataset(
+                roots, split='train', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                windows_needed=train_windows_needed, policy=mixing_policy, weights=mixing_weights
+            )
+            stage_val_ds = build_capped_mixed_dataset(
+                roots, split='val', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                windows_needed=val_windows_needed, policy=mixing_policy, weights=mixing_weights
+            )
+        else:
+            stage_train_ds = build_mixed_dataset(roots, split='train', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                                                 policy=mixing_policy, weights=mixing_weights)
+            stage_val_ds = build_mixed_dataset(roots, split='val', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
+                                               policy=mixing_policy, weights=mixing_weights)
+
+        # Debug counts for visibility
+        print(f"[stage] {stage_name}: roots={len(roots)}; building DataLoaders")
+
+        stage_train_loader = DataLoader(stage_train_ds, batch_size, **self._get_dataloader_kwargs(for_eval=False))
+        stage_val_loader = DataLoader(stage_val_ds, batch_size, **self._get_dataloader_kwargs(for_eval=True))
+
+        return stage_train_loader, stage_val_loader
+
+
+def _setup_device_and_autocast(device: str):
+    """Setup device-specific autocast context."""
+    if device == 'cuda':
+        autocast_ctx = torch.amp.autocast(device_type='cuda')
+    elif device == 'cpu':
+        autocast_ctx = torch.amp.autocast(device_type='cpu')
+    else:
+        # MPS or other devices: disable autocast for stability
+        autocast_ctx = contextlib.nullcontext()
+    return autocast_ctx
+
+
+class CurriculumManager:
+    """Manages curriculum learning stages and their execution."""
+
+    def __init__(self, dataset_builder: DatasetBuilder, seq_length: int, batch_size: int,
+                 mixing_policy: str, mixing_weights: Optional[List[float]]):
+        self.dataset_builder = dataset_builder
+        self.seq_length = seq_length
+        self.batch_size = batch_size
+        self.mixing_policy = mixing_policy
+        self.mixing_weights = mixing_weights
+
+    def run_curriculum(self, curriculum: List[Dict[str, Any]], stage_runner):
+        """Run all curriculum stages."""
+        for stage in curriculum:
+            stage_name = stage.get('name', 'stage')
+            stage_epochs = int(stage.get('epochs', 1))
+            stage_lr = float(stage.get('lr', 3e-4))
+            stage_steps = stage.get('steps', None)
+            if stage_steps is not None:
+                stage_steps = int(stage_steps)
+                if stage_steps <= 0:
+                    raise ValueError(f"Curriculum stage '{stage_name}' has invalid steps={stage_steps}; must be > 0")
+                print(f"[stage] {stage_name}: limiting to {stage_steps} steps")
+
+            # Create datasets and loaders for this stage
+            stage_train_loader, stage_val_loader = self.dataset_builder.create_curriculum_datasets_and_loaders(
+                stage, self.seq_length, self.batch_size, self.mixing_policy, self.mixing_weights
+            )
+
+            # Run the stage
+            stage_runner.run_stage(stage_name, stage_train_loader, stage_val_loader, stage_epochs, stage_lr, stage_steps)
+
+
+class StageRunner:
+    """Handles execution of individual training stages."""
+
+    def __init__(self, model: XOR8BitLM, device: str, eval_interval: int, ema_alpha: float,
+                 test_prompt: str, model_path: Union[str, Path], run,
+                 mutor_mode: str, mutor_density_ratio: float, mutor_min_spacing: int,
+                 mutor_update_every: int, mutor_buffer_momentum: float, mutor_bit_divergence_weight: float):
+        self.model = model
+        self.device = device
+        self.eval_interval = eval_interval
+        self.ema_alpha = ema_alpha
+        self.test_prompt = test_prompt
+        self.model_path = model_path
+        self.run = run
+        self.mutor_mode = mutor_mode
+        self.mutor_density_ratio = mutor_density_ratio
+        self.mutor_min_spacing = mutor_min_spacing
+        self.mutor_update_every = mutor_update_every
+        self.mutor_buffer_momentum = mutor_buffer_momentum
+        self.mutor_bit_divergence_weight = mutor_bit_divergence_weight
+
+    def _setup_stage_freezing(self, stage_name: str):
+        """Apply stage-specific parameter freezing."""
+        if stage_name == 'school':
+            # Freeze lower layers and bit projection
+            n_freeze = int(len(self.model.layers) * 0.8)  # Freeze 60% of layers
+
+            # Freeze bit projection
+            self.model.bit_proj.weight.requires_grad = False
+
+            # Freeze RoPE (positional encoding)
+            for param in self.model.rope.parameters():
+                param.requires_grad = False
+
+            # Freeze lower transformer layers
+            for i in range(n_freeze):
+                for param in self.model.layers[i].parameters():
+                    param.requires_grad = False
+
+            return self.mutor_bit_divergence_weight * 0.8  # Reduce bit divergence weight
+        return self.mutor_bit_divergence_weight
+
+    def run_stage(self, stage_name: str, train_loader, val_loader, epochs: int, lr: float, steps: Optional[int] = None):
+        """Run a single training stage."""
+        steps_per_epoch = max(len(train_loader), 1)
+        planned_total = steps_per_epoch * epochs
+        effective_total = planned_total if steps is None else min(planned_total, int(steps))
+        print(f"[stage] {stage_name}: steps_per_epoch={steps_per_epoch}, planned_total={planned_total}, effective_total={effective_total}")
+
+        # Apply stage-specific modifications
+        bit_divergence_weight = self._setup_stage_freezing(stage_name)
+
+        # Create trainer for this stage
+        trainer = Trainer(
+            self.model,
+            lr=lr,
+            device=self.device,
+            total_steps=effective_total,
+            warmup_steps=min(1000, effective_total // 10),
+            ema_alpha=self.ema_alpha,
+            mutor_mode=self.mutor_mode,
+            mutor_density_ratio=self.mutor_density_ratio,
+            mutor_min_spacing=self.mutor_min_spacing,
+            mutor_update_every=self.mutor_update_every,
+            mutor_buffer_momentum=self.mutor_buffer_momentum,
+            mutor_bit_divergence_weight=bit_divergence_weight,
+        )
+
+        val_iter = itertools.cycle(val_loader)
+        global_step = 0
+        reached_cap = False
+
+        for epoch in range(epochs):
+            self.model.train()
+            pbar = tqdm(train_loader, desc=f"{stage_name} Epoch {epoch+1}/{epochs}")
+            for batch_idx, train_batch in enumerate(pbar):
+                loss = trainer.train_step(train_batch)
+                global_step += 1
+
+                # Quick eval update
+                if global_step % self.eval_interval == 0:
+                    if trainer.quick_eval_k <= 1:
+                        val_batch = next(val_iter)
+                        trainer.quick_eval_update(val_batch)
+                    else:
+                        batches = list(itertools.islice(val_iter, int(trainer.quick_eval_k)))
+                        trainer.quick_eval_update_many(batches)
+
+                pbar.set_postfix({
+                    'loss': f"{loss:.4f}",
+                    'train/slow': f"{trainer.metrics.train_slow:.4f}" if trainer.metrics.train_slow else "N/A",
+                    'train/fast': f"{trainer.metrics.train_fast:.4f}" if trainer.metrics.train_fast else "N/A",
+                    'eval/slow': f"{trainer.metrics.eval_slow:.4f}" if trainer.metrics.eval_slow else "N/A",
+                    'eval/fast': f"{trainer.metrics.eval_fast:.4f}" if trainer.metrics.eval_fast else "N/A",
+                    'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
+                    'grok': f"{trainer.metrics.get_signal():.3f}"
+                })
+
+                self.run.log({
+                    'train/loss': loss,
+                    'train/ema_slow': trainer.metrics.train_slow,
+                    'train/ema_fast': trainer.metrics.train_fast,
+                    'validation/ema_slow': trainer.metrics.eval_slow,
+                    'validation/ema_fast': trainer.metrics.eval_fast,
+                    'perplexity/ema': trainer.metrics.perp_ema,
+                    'grok': trainer.metrics.get_signal()
+                })
+
+                if steps is not None and global_step >= int(steps):
+                    print(f"[stage] {stage_name}: reached step cap ({global_step}/{int(steps)}); ending stage after summary.")
+                    reached_cap = True
+                    break
+
+            # Full eval snapshot
+            self.model.eval()
+            eval_losses = []
+            for i, batch in enumerate(itertools.islice(val_loader, 100)):
+                loss, n_tokens = trainer.eval_step(batch)
+                if n_tokens > 0:
+                    eval_losses.append(loss)
+            if eval_losses:
+                avg_eval_loss = np.mean(eval_losses)
+                epoch_perplexity = math.exp(min(avg_eval_loss, 20))
+                print(f"\n{stage_name} Epoch {epoch+1} Summary:")
+                print(f"  Streaming - Train EMA: {trainer.metrics.train_slow:.4f}, "
+                      f"Eval EMA: {trainer.metrics.eval_slow:.4f}, "
+                      f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
+                print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
+                print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
+                self.run.log({
+                    'validation/loss': avg_eval_loss,
+                    'validation/perplexity': epoch_perplexity,
+                    'validation/grok': trainer.metrics.get_signal()
+                })
+
+            # Save checkpoint
+            save_model(self.model, self.model_path, {
+                'd_model': self.model.d_model,
+                'n_heads': self.model.n_heads,
+                'n_layers': len(self.model.layers),
+                'max_len': self.model.rope.max_seq_len,
+                'rope_base': self.model.rope.base,
+                'best_perp_seen': trainer.metrics.best_perp_seen,
+                'stage': stage_name,
+                'epoch': epoch + 1
+            }, checkpoint=True, epoch=epoch + 1)
+
+            self.model.eval()
+            sample = self.model.generate(self.test_prompt, max_len=60)
+            print(f"\nSample ({stage_name}): {sample}\n")
+
+            if reached_cap:
+                break
+
+
 def train(
     data_path: Union[str, Path],
     val_path: Optional[Union[str, Path]] = None,  # Optional separate validation set
@@ -2024,91 +2217,6 @@ def train(
 
     print(f"Training on {device}")
 
-    # Helper to build device-tuned DataLoader args
-    def _loader_kwargs(for_eval: bool = False):
-        if device == 'cuda':
-            workers = min(8, (os.cpu_count() or 8))
-            return dict(num_workers=workers, pin_memory=True, persistent_workers=True, prefetch_factor=4, shuffle=not for_eval)
-        elif device == 'mps':
-            return dict(num_workers=0, pin_memory=False, persistent_workers=False, prefetch_factor=None, shuffle=not for_eval)
-        else:
-            workers = min(4, (os.cpu_count() or 4))
-            return dict(num_workers=workers, pin_memory=False, persistent_workers=True, prefetch_factor=2, shuffle=not for_eval)
-
-    # Create datasets and loaders (packed preferred)
-    def _build_packed_dataset(roots: List[Union[str, Path]]):
-        # For each root, discover shards and concatenate them into one dataset
-        ds_per_root = []
-        for r in roots:
-            shard_dirs = discover_shards(str(r))
-            if not shard_dirs:
-                continue
-            shard_datasets = [
-                PackedXORShardDataset(sd, seq_length=seq_length, stride=seq_length//2, pad_id=GrayCodeEncoder.PAD)
-                for sd in shard_dirs
-            ]
-            if len(shard_datasets) == 1:
-                ds_per_root.append(shard_datasets[0])
-            else:
-                ds_per_root.append(torch.utils.data.ConcatDataset(shard_datasets))
-
-        if not ds_per_root:
-            raise ValueError("No shards found in provided packed_dirs")
-
-        if len(ds_per_root) == 1:
-            return ds_per_root[0]
-
-        return MixedPackedXORDataset(ds_per_root, policy=mixing_policy, weights=mixing_weights)
-
-    using_curriculum = bool(curriculum and len(curriculum) > 0)
-
-    if not using_curriculum:
-        use_packed = False
-        train_dataset = None
-        val_dataset = None
-
-        if packed_dirs is not None and len(packed_dirs) > 0:
-            train_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
-            use_packed = True
-            print(f"Using packed datasets for training. policy={mixing_policy}, weights={mixing_weights}")
-        else:
-            # Auto-detect packed shards under data_path directory
-            dp = Path(data_path)
-            if dp.is_dir():
-                shard_dirs = discover_shards(str(dp))
-                if shard_dirs:
-                    train_dataset = _build_packed_dataset([dp])
-                    use_packed = True
-                    print(f"Auto-detected packed shards under {dp}")
-
-        if train_dataset is None:
-            # Fallback to simple text dataset
-            train_dataset = XORDataset(data_path, seq_length)
-
-        train_loader = DataLoader(train_dataset, batch_size, **_loader_kwargs(for_eval=False))
-
-        # Validation dataset
-        if val_packed_dirs is not None and len(val_packed_dirs) > 0:
-            val_dataset = _build_packed_dataset([str(p) for p in val_packed_dirs])
-        elif val_path is not None:
-            vp = Path(val_path)
-            if vp.is_dir() and discover_shards(str(vp)):
-                val_dataset = _build_packed_dataset([vp])
-            else:
-                val_dataset = XORDataset(val_path, seq_length)
-        else:
-            if use_packed:
-                # Heuristic: reuse train roots for eval with full-stride windows (no shuffle in loader)
-                if packed_dirs is not None and len(packed_dirs) > 0:
-                    val_dataset = _build_packed_dataset([str(p) for p in packed_dirs])
-                else:
-                    val_dataset = _build_packed_dataset([dp])
-            else:
-                # Use 10% of training data with different stride for pseudo-validation
-                val_dataset = XORDataset(data_path, seq_length, stride=seq_length)
-
-        val_loader = DataLoader(val_dataset, batch_size, **_loader_kwargs(for_eval=True))
-
     # Create model once and reuse across stages
     model = XOR8BitLM(d_model, n_heads, n_layers, seq_length, rope_base, mutor_dmax=20)
 
@@ -2116,205 +2224,47 @@ def train(
     if compile_model and hasattr(torch, 'compile'):
         model = torch.compile(model)
 
-    def _run_stage(stage_name: str, stage_train_loader, stage_val_loader, stage_epochs: int, stage_lr: float, stage_steps: Optional[int] = None):
-        steps_per_epoch = max(len(stage_train_loader), 1)
-        planned_total = steps_per_epoch * stage_epochs
-        effective_total = planned_total if stage_steps is None else min(planned_total, int(stage_steps))
-        print(f"[stage] {stage_name}: steps_per_epoch={steps_per_epoch}, planned_total={planned_total}, effective_total={effective_total}")
+    # Create helper classes
+    dataset_builder = DatasetBuilder(device)
+    curriculum_manager = CurriculumManager(dataset_builder, seq_length, batch_size, mixing_policy, mixing_weights)
+    stage_runner = StageRunner(
+        model, device, eval_interval, ema_alpha, test_prompt, model_path, run,
+        mutor_mode, mutor_density_ratio, mutor_min_spacing, mutor_update_every,
+        mutor_buffer_momentum, mutor_bit_divergence_weight
+    )
 
-        bit_divergence_weight = mutor_bit_divergence_weight
-
-        if stage_name == 'school':
-            # Freeze lower layers and bit projection
-            n_freeze = int(len(model.layers) * 0.8)  # Freeze 60% of layers
-
-            bit_divergence_weight = 0.25
-
-            # Freeze bit projection
-            model.bit_proj.weight.requires_grad = False
-
-            # Freeze RoPE (positional encoding)
-            for param in model.rope.parameters():
-                param.requires_grad = False
-
-            # Freeze lower transformer layers
-            for i in range(n_freeze):
-                for param in model.layers[i].parameters():
-                    param.requires_grad = False
-
-        trainer = Trainer(
-            model,
-            lr=stage_lr,
-            device=device,
-            total_steps=effective_total,
-            warmup_steps=min(1000, effective_total // 10),
-            ema_alpha=ema_alpha,
-            mutor_mode=mutor_mode,
-            mutor_density_ratio=mutor_density_ratio,
-            mutor_min_spacing=mutor_min_spacing,
-            mutor_update_every=mutor_update_every,
-            mutor_buffer_momentum=mutor_buffer_momentum,
-            mutor_bit_divergence_weight=bit_divergence_weight,
-        )
-
-        val_iter = itertools.cycle(stage_val_loader)
-        global_step = 0
-        reached_cap = False
-        for epoch in range(stage_epochs):
-            model.train()
-            pbar = tqdm(stage_train_loader, desc=f"{stage_name} Epoch {epoch+1}/{stage_epochs}")
-            for batch_idx, train_batch in enumerate(pbar):
-                loss = trainer.train_step(train_batch)
-                global_step += 1
-                if global_step % eval_interval == 0:
-                    if trainer.quick_eval_k <= 1:
-                        val_batch = next(val_iter)
-                        trainer.quick_eval_update(val_batch)
-                    else:
-                        batches = list(itertools.islice(val_iter, int(trainer.quick_eval_k)))
-                        trainer.quick_eval_update_many(batches)
-                pbar.set_postfix({
-                    'loss': f"{loss:.4f}",
-                    'train/slow': f"{trainer.metrics.train_slow:.4f}" if trainer.metrics.train_slow else "N/A",
-                    'train/fast': f"{trainer.metrics.train_fast:.4f}" if trainer.metrics.train_fast else "N/A",
-                    'eval/slow': f"{trainer.metrics.eval_slow:.4f}" if trainer.metrics.eval_slow else "N/A",
-                    'eval/fast': f"{trainer.metrics.eval_fast:.4f}" if trainer.metrics.eval_fast else "N/A",
-                    'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
-                    'grok': f"{trainer.metrics.get_signal():.3f}"
-                })
-                run.log({
-                    'train/loss': loss,
-                    'train/ema_slow': trainer.metrics.train_slow,
-                    'train/ema_fast': trainer.metrics.train_fast,
-                    'validation/ema_slow': trainer.metrics.eval_slow,
-                    'validation/ema_fast': trainer.metrics.eval_fast,
-                    'perplexity/ema': trainer.metrics.perp_ema,
-                    'grok': trainer.metrics.get_signal()
-                })
-                if stage_steps is not None and global_step >= int(stage_steps):
-                    print(f"[stage] {stage_name}: reached step cap ({global_step}/{int(stage_steps)}); ending stage after summary.")
-                    reached_cap = True
-                    break
-
-            # Quick full eval snapshot
-            model.eval()
-            eval_losses = []
-            for i, batch in enumerate(itertools.islice(stage_val_loader, 100)):
-                loss, n_tokens = trainer.eval_step(batch)
-                if n_tokens > 0:
-                    eval_losses.append(loss)
-            if eval_losses:
-                avg_eval_loss = np.mean(eval_losses)
-                epoch_perplexity = math.exp(min(avg_eval_loss, 20))
-                print(f"\n{stage_name} Epoch {epoch+1} Summary:")
-                print(f"  Streaming - Train EMA: {trainer.metrics.train_slow:.4f}, "
-                      f"Eval EMA: {trainer.metrics.eval_slow:.4f}, "
-                      f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
-                print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
-                print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
-                run.log({
-                    'validation/loss': avg_eval_loss,
-                    'validation/perplexity': epoch_perplexity,
-                    'validation/grok': trainer.metrics.get_signal()
-                })
-
-            # Save checkpoint per epoch
-            save_model(model, model_path, {
-                'd_model': model.d_model,
-                'n_heads': model.n_heads,
-                'n_layers': len(model.layers),
-                'max_len': model.rope.max_seq_len,
-                'rope_base': model.rope.base,
-                'best_perp_seen': trainer.metrics.best_perp_seen,
-                'stage': stage_name,
-                'epoch': epoch + 1
-            }, checkpoint=True, epoch=epoch + 1)
-
-            model.eval()
-            sample = model.generate(test_prompt, max_len=60)
-            print(f"\nSample ({stage_name}): {sample}\n")
-            if reached_cap:
-                break
-
+    # Run training
+    using_curriculum = bool(curriculum and len(curriculum) > 0)
     if using_curriculum:
-        # Run staged training with automatic split and mixing per dataset root
-        for stage in curriculum:
-            stage_name = stage.get('name', 'stage')
-            stage_epochs = int(stage.get('epochs', 1))
-            stage_lr = float(stage.get('lr', lr))
-            stage_steps = stage.get('steps', None)
-            if stage_steps is not None:
-                stage_steps = int(stage_steps)
-                if stage_steps <= 0:
-                    raise ValueError(f"Curriculum stage '{stage_name}' has invalid steps={stage_steps}; must be > 0")
-                print(f"[stage] {stage_name}: limiting to {stage_steps} steps")
-            # Accept either 'packed_roots' (preferred) or legacy 'packed_dirs'
-            roots = stage.get('packed_roots') or stage.get('packed_dirs') or []
-            roots = [str(p) for p in roots]
-            if not roots:
-                raise ValueError(f"Curriculum stage '{stage_name}' requires 'packed_roots' or 'packed_dirs'")
-
-            # Ensure train/val split exists (create if missing) for each dataset root
-            val_ratio = float(stage.get('val_ratio', 0.05))
-            split_pairs = []
-            for r in roots:
-                tr_dir, va_dir = ensure_train_val_split(r, val_ratio=val_ratio, seed=42)
-                split_pairs.append((tr_dir, va_dir))
-
-            # Build mixed datasets across all roots for this stage
-            if stage_steps is not None:
-                # Estimate windows needed for training and small validation
-                # Each step consumes one batch; each batch uses `batch_size` windows
-                train_windows_needed = int(stage_steps) * int(batch_size)
-                # For validation: approximate 100 batches like quick eval upper bound
-                val_batches = 100
-                val_windows_needed = val_batches * int(batch_size)
-                print(f"[stage] {stage_name}: capping dataset selection -> train_windows~{train_windows_needed}, val_windows~{val_windows_needed}")
-                stage_train_ds = build_capped_mixed_dataset(
-                    roots, split='train', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
-                    windows_needed=train_windows_needed, policy=mixing_policy, weights=mixing_weights
-                )
-                stage_val_ds = build_capped_mixed_dataset(
-                    roots, split='val', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
-                    windows_needed=val_windows_needed, policy=mixing_policy, weights=mixing_weights
-                )
-            else:
-                stage_train_ds = build_mixed_dataset(roots, split='train', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
-                                                     policy=mixing_policy, weights=mixing_weights)
-                stage_val_ds = build_mixed_dataset(roots, split='val', seq_length=seq_length, pad_id=GrayCodeEncoder.PAD,
-                                                   policy=mixing_policy, weights=mixing_weights)
-
-            # Debug counts for visibility
-            print(f"[stage] {stage_name}: roots={len(roots)}; building DataLoaders")
-
-            stage_train_loader = DataLoader(stage_train_ds, batch_size, **_loader_kwargs(for_eval=False))
-            stage_val_loader = DataLoader(stage_val_ds, batch_size, **_loader_kwargs(for_eval=True))
-            _run_stage(stage_name, stage_train_loader, stage_val_loader, stage_epochs, stage_lr, stage_steps=stage_steps)
+        curriculum_manager.run_curriculum(curriculum, stage_runner)
     else:
         # Single-stage legacy flow
-        _run_stage('main', train_loader, val_loader, epochs, lr)
+        train_loader, val_loader = dataset_builder.create_datasets_and_loaders(
+            data_path, val_path, packed_dirs, val_packed_dirs,
+            seq_length, batch_size, mixing_policy, mixing_weights
+        )
+        stage_runner.run_stage('main', train_loader, val_loader, epochs, lr)
 
     run.finish()
-
     save_model(model, model_path)
     return model
 
 
 def run_test_generations(model: XOR8BitLM, input_text: str, max_len: int = 512):
     model.eval()
-    output = model.generate_with_cache(input_text, max_len=max_len)
+    output = model.generate(input_text, max_len=max_len)
     print(f"\nGenerated (top-k, temp=1.0):\n{output}\n")
-    output = model.generate_with_cache(input_text, max_len=max_len, temp=0.5)
+    output = model.generate(input_text, max_len=max_len, temp=0.5)
     print(f"\nGenerated (top-k, temp=0.5):\n{output}\n")
 
-    output = model.generate_with_cache(input_text, max_len=max_len, sampling='top_h')
+    output = model.generate(input_text, max_len=max_len, sampling='top_h')
     print(f"\nGenerated (top-h, temp=1.0):\n{output}\n")
-    output = model.generate_with_cache(input_text, max_len=max_len, sampling='top_h', temp=0.5)
+    output = model.generate(input_text, max_len=max_len, sampling='top_h', temp=0.5)
     print(f"\nGenerated (top-h, temp=0.5):\n{output}\n")
 
-    output = model.generate_with_cache("What is 2 + 2?", max_len=512, apply_chat_template=True)
+    output = model.generate("What is 2 + 2?", max_len=512, apply_chat_template=True)
     print(f"\nGenerated (chat template, temp=1.0):\n{output}\n")
-    output = model.generate_with_cache("What is 2 + 2?", max_len=512, apply_chat_template=True, sampling='top_h')
+    output = model.generate("What is 2 + 2?", max_len=512, apply_chat_template=True, sampling='top_h')
     print(f"\nGenerated (chat template, top-h):\n{output}\n")
 
 # ============= EXAMPLE USAGE =============
@@ -2355,16 +2305,16 @@ if __name__ == "__main__":
                 test_prompt="The "
             )
 
-            output = model.generate_with_cache(input_text, max_len=200)
+            output = model.generate(input_text, max_len=200)
             print(f"\nGenerated:\n{output}")
 
         else:
             model = train(
             "datasets/packed",
             model_path="xor_test",
-            seq_length=566,
+            seq_length=1069,
             eval_interval=25,
-            batch_size=16,
+            batch_size=4,
             epochs=5,
             d_model=64,
             n_heads=8,
@@ -2378,17 +2328,17 @@ if __name__ == "__main__":
                     'packed_roots': [
                         'datasets/packed/tiny-stories-512',
                     ],
-                    'epochs': 1,
-                    #'steps': 5000,
+                    #'epochs': 1,
+                    'steps': 1000,
                     'lr': 3e-4
                 },
                 {
                     'name': 'school',
                     'packed_roots': [
-                        'datasets/packed/tiny-stories-instruct-512',
+                        'datasets/packed/tiny-stories-instruct-1024',
                     ],
-                    'epochs': 1,
-                    #'steps': 4000,
+                    #'epochs': 1,
+                    'steps': 100,
                     'lr': 5e-5
                 }
             ]
@@ -2432,13 +2382,7 @@ if __name__ == "__main__":
             ]
         )
 
-    output = model.generate_with_cache("What is 2 + 2?", max_len=512, apply_chat_template=True)
+    output = model.generate("What is 2 + 2?", max_len=512, apply_chat_template=True)
     print(f"\nGenerated: {output}")
 
-    # output = model.generate_with_cache("Elu on ilus.", max_len=512)
-    #print(f"\nGenerated: {output}")
-
     run_test_generations(model, "The world is a cold place.", max_len=512)
-
-    # Or train from HuggingFace
-    # model = train_from_hf("wikitext", "wikitext-2-raw-v1", epochs=5)
