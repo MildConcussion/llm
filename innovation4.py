@@ -2167,7 +2167,7 @@ def train(
                 loss = trainer.train_step(train_batch)
                 global_step += 1
                 if global_step % eval_interval == 0:
-                    if getattr(trainer, 'quick_eval_k', 1) <= 1:
+                    if trainer.quick_eval_k <= 1:
                         val_batch = next(val_iter)
                         trainer.quick_eval_update(val_batch)
                     else:
@@ -2225,7 +2225,7 @@ def train(
                 'n_layers': len(model.layers),
                 'max_len': model.rope.max_seq_len,
                 'rope_base': model.rope.base,
-                'best_perplexity': trainer.metrics.best_perp,
+                'best_perp_seen': trainer.metrics.best_perp_seen,
                 'stage': stage_name,
                 'epoch': epoch + 1
             }, checkpoint=True, epoch=epoch + 1)
@@ -2362,12 +2362,13 @@ if __name__ == "__main__":
             model = train(
             "datasets/packed",
             model_path="xor_test",
-            seq_length=564,
-            batch_size=4,
+            seq_length=1069,
+            eval_interval=25,
+            batch_size=8,
             epochs=5,
             d_model=64,
             n_heads=8,
-            n_layers=6,
+            n_layers=8,
             rope_base=10000,
             test_prompt="The ",
             mixing_policy='round_robin_wrap',
@@ -2384,7 +2385,7 @@ if __name__ == "__main__":
                 {
                     'name': 'school',
                     'packed_roots': [
-                        'datasets/packed/orca-inst-512',
+                        'datasets/packed/tiny-stories-instruct-1024',
                     ],
                     'epochs': 1,
                     #'steps': 4000,

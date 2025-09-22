@@ -375,13 +375,29 @@ def pack_hf_qwen_with_masks(
       - 'single_turn_instruct' for columns {prompt?, question, response}
       - 'single_turn_codes' for columns {prompt?, response} with filters
       - 'multi_turn_chat' for column 'data' = list[str] alternating user/assistant; emits multiple documents per row
+      - 'tiny_stories_instruct' for TinyStoriesInstruct dataset (groups rows into stories, creates instruction-response pairs)
     """
     print(f"[hf] loading dataset={dataset} subset={subset} split={split} task={task_type}")
     from datasets import load_dataset
     ds = load_dataset(dataset, name=subset, split=split)
 
+    # Special handling for tiny_stories_instruct: group rows into complete stories
+    if task_type == 'tiny_stories_instruct':
+        stories = []
+        current_story = []
+        for i, ex in enumerate(ds):
+            text = ex['text']
+            current_story.append(text)
+            if '<|endoftext|>' in text:
+                stories.append(current_story)
+                current_story = []
+                if len(stories) >= 100000:
+                    break
+        print(f"[tiny_stories] grouped {len(stories)} complete stories from {len(ds)} rows")
+        ds = stories  # Replace dataset with grouped stories
+
     # Apply filters for codes if requested
-    if task_type == 'single_turn_codes':
+    elif task_type == 'single_turn_codes':
         if programming_languages:
             langs = set(programming_languages)
             ds = ds.filter(lambda ex: ex.get('programming_language', None) in langs)
@@ -560,6 +576,67 @@ def pack_hf_qwen_with_masks(
                     _emit_doc(toks, mask)
                     _maybe_flush()
 
+            elif task_type == 'tiny_stories_instruct':
+                # ex is now a list of strings representing one complete story
+                story_lines = ex
+
+                # Parse the story components
+                features = None
+                words = None
+                summary = None
+                story_content = []
+
+                i = 0
+                while i < len(story_lines):
+                    line = story_lines[i]
+                    if line.startswith('Features: '):
+                        features = line[len('Features: '):]
+                    elif line.startswith('Words: '):
+                        words = line[len('Words: '):]
+                    elif line.startswith('Summary: '):
+                        summary = line[len('Summary: '):]
+                    elif line == 'Story: ':
+                        # Story content starts after this
+                        i += 2  # Skip the empty line after "Story: "
+                        while i < len(story_lines) and not story_lines[i].startswith('<|endoftext|>'):
+                            if story_lines[i]:  # Skip empty lines
+                                story_content.append(story_lines[i])
+                            i += 1
+                        break
+                    i += 1
+
+                if not all([features, words, summary]) or not story_content:
+                    continue  # Skip malformed stories
+
+                # Create instruction
+                instruction = f"Write a story with {features} that includes the words {words} and has this summary: {summary}"
+
+                # Join story content
+                response = '\n'.join(story_content)
+
+                # Create Qwen-style message
+                segs = [
+                    _encode_qwen_message(encoder, 'user', instruction)
+                ]
+                pre_len = sum(s.shape[0] for s in segs) + 1  # +1 for START
+                asst_seg = _encode_qwen_message(encoder, 'assistant', response)
+                toks = _concat_segments_with_bookends(encoder, segs + [asst_seg])
+
+                if max_encoded_len is not None and int(toks.shape[0]) > int(max_encoded_len):
+                    skipped_too_long += 1
+                    continue
+
+                mask = np.zeros_like(toks, dtype=np.uint8)
+                # Build mask over assistant content: find boundaries inside asst_seg
+                role_prefix_len = len(b'assistant\n')
+                asst_start = pre_len + 1 + role_prefix_len  # after IM_START + role\n
+                asst_total = asst_seg.shape[0]
+                content_len = max(0, asst_total - (1 + 1) - role_prefix_len)
+                asst_end = asst_start + content_len
+                mask |= _mask_span(toks.shape[0], asst_start, asst_end)
+                _emit_doc(toks, mask)
+                _maybe_flush()
+
             else:
                 continue
         except Exception:
@@ -615,7 +692,7 @@ if __name__ == '__main__':
     ap_hfq.add_argument('--subset', default=None, help='Optional subset name')
     ap_hfq.add_argument('--split', default='train', help='Split name to read (default: train)')
     ap_hfq.add_argument('--out', required=True, help='Output directory for shards')
-    ap_hfq.add_argument('--task_type', required=True, choices=['pretrain_text','single_turn_instruct','single_turn_codes','multi_turn_chat'])
+    ap_hfq.add_argument('--task_type', required=True, choices=['pretrain_text','single_turn_instruct','single_turn_codes','multi_turn_chat','tiny_stories_instruct'])
     ap_hfq.add_argument('--programming_languages', nargs='*', default=None, help='Filter for codes: languages to include')
     ap_hfq.add_argument('--target_audiences', nargs='*', default=None, help='Filter for codes: audiences in ascending difficulty order')
     ap_hfq.add_argument('--shard_tokens', type=int, default=5_000_000)
