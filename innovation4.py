@@ -1214,44 +1214,127 @@ class XOR8BitLM(nn.Module):
 # ============= TRAINING =============
 
 class StreamingGrokMetrics:
-    """Exponential moving average metrics for fast grokking signals."""
+    """Enhanced grokking detector with derivatives and phase tracking."""
 
-    def __init__(self, alpha=0.99):
-        self.alpha = alpha  # EMA decay
-        self.train_loss_ema = None
-        self.eval_loss_ema = None
+    def __init__(self, alpha_slow=0.99, alpha_fast=0.9):
+        # Dual timescales for better transition detection
+        self.alpha_slow = alpha_slow
+        self.alpha_fast = alpha_fast
+
+        # Slow EMAs (smooth trends)
+        self.train_slow = None
+        self.eval_slow = None
+
+        # Fast EMAs (responsive to changes)
+        self.train_fast = None
+        self.eval_fast = None
+
+        # Derivative tracking
+        self.eval_prev = None
+        self.eval_velocity = 0.0  # First derivative
+        self.eval_accel = 0.0     # Second derivative
+
+        # Phase tracking
+        self.phase = 'fitting'  # 'fitting', 'memorizing', 'grokking', 'generalized'
+        self.memorization_steps = 0
+        self.grokking_confidence = 0.0
+
         self.perp_ema = None
         self.best_perp = float('inf')
 
     def update_train(self, loss: float):
-        if self.train_loss_ema is None:
-            self.train_loss_ema = loss
+        if self.train_slow is None:
+            self.train_slow = loss
+            self.train_fast = loss
         else:
-            self.train_loss_ema = self.alpha * self.train_loss_ema + (1 - self.alpha) * loss
+            self.train_slow = self.alpha_slow * self.train_slow + (1 - self.alpha_slow) * loss
+            self.train_fast = self.alpha_fast * self.train_fast + (1 - self.alpha_fast) * loss
 
     def update_eval(self, loss: float, perplexity: float):
-        if self.eval_loss_ema is None:
-            self.eval_loss_ema = loss
+        # Update EMAs
+        if self.eval_slow is None:
+            self.eval_slow = loss
+            self.eval_fast = loss
+            self.eval_prev = loss
             self.perp_ema = perplexity
         else:
-            self.eval_loss_ema = self.alpha * self.eval_loss_ema + (1 - self.alpha) * loss
-            self.perp_ema = self.alpha * self.perp_ema + (1 - self.alpha) * perplexity
+            self.eval_slow = self.alpha_slow * self.eval_slow + (1 - self.alpha_slow) * loss
+            self.eval_fast = self.alpha_fast * self.eval_fast + (1 - self.alpha_fast) * loss
+
+            # Compute derivatives (normalized by magnitude to handle different scales)
+            new_velocity = loss - self.eval_prev
+            velocity_change = new_velocity - self.eval_velocity
+
+            # Update with momentum for stability
+            self.eval_velocity = 0.9 * self.eval_velocity + 0.1 * new_velocity
+            self.eval_accel = 0.9 * self.eval_accel + 0.1 * velocity_change
+            self.eval_prev = loss
+            self.perp_ema = self.alpha_slow * self.perp_ema + (1 - self.alpha_slow) * perplexity
 
         self.best_perp = min(self.best_perp, perplexity)
 
+        # Update phase state machine
+        self._update_phase()
+
+    def _update_phase(self):
+        """Simple phase detector based on loss patterns."""
+        if self.train_slow is None or self.eval_slow is None:
+            return
+
+        train_converged = self.train_slow < 0.1  # Near zero
+        eval_high = self.eval_slow > 0.5  # Still struggling
+        eval_dropping = self.eval_velocity < -0.01  # Improving
+        eval_accelerating = self.eval_accel < -0.001  # Improving faster
+
+        prev_phase = self.phase
+
+        if not train_converged:
+            self.phase = 'fitting'
+            self.memorization_steps = 0
+        elif train_converged and eval_high and not eval_dropping:
+            self.phase = 'memorizing'
+            self.memorization_steps += 1
+        elif train_converged and eval_dropping and self.memorization_steps > 10:
+            # Key insight: require prior memorization before declaring grokking
+            if eval_accelerating:
+                self.phase = 'grokking'
+                self.grokking_confidence = min(1.0, self.grokking_confidence + 0.1)
+            else:
+                self.phase = 'grokking'
+                self.grokking_confidence = min(1.0, self.grokking_confidence + 0.05)
+        elif self.eval_slow < 0.3 and abs(self.eval_velocity) < 0.005:
+            self.phase = 'generalized'
+
+        # Log phase transitions
+        if prev_phase != self.phase:
+            print(f"[Phase transition] {prev_phase} → {self.phase}")
+
     def get_signal(self) -> float:
-        if self.train_loss_ema is None or self.eval_loss_ema is None:
+        """Clean, interpretable grokking signal based on phase and dynamics."""
+        if self.train_slow is None or self.eval_slow is None:
             return 0.0
 
-        # Smooth signals with EMA
-        loss_gap = max(0, self.eval_loss_ema - self.train_loss_ema)
-        loss_signal = loss_gap / max(self.eval_loss_ema, self.train_loss_ema, 1e-6)
+        # Core signal: Are we memorized but not generalized?
+        memorized = float(self.train_slow < 0.1)
+        gap = max(0, self.eval_slow - self.train_slow) / max(self.eval_slow, 0.1)
 
-        perp_signal = 0.0
-        if self.best_perp < float('inf'):
-            perp_signal = max(0, (self.perp_ema - self.best_perp) / self.best_perp)
+        # Boost signal during active grokking (negative acceleration = improvement)
+        improvement_rate = max(0, -self.eval_velocity * 10)  # Scale for visibility
+        acceleration_bonus = max(0, -self.eval_accel * 50)
 
-        return 0.7 * loss_signal + 0.3 * perp_signal
+        # Phase-aware combination
+        if self.phase == 'memorizing':
+            # High signal: we're stuck memorizing
+            return memorized * gap * 0.8
+        elif self.phase == 'grokking':
+            # Very high signal: active grokking happening!
+            return min(1.0, memorized * (gap + improvement_rate + acceleration_bonus))
+        elif self.phase == 'generalized':
+            # Low signal: we've succeeded
+            return 0.1
+        else:  # fitting
+            # Medium signal during initial fitting
+            return gap * 0.3
 
 class Trainer:
     """Efficient trainer with mixed precision and gradient accumulation."""
@@ -1264,21 +1347,24 @@ class Trainer:
                  mutor_min_spacing: int = 4,
                  mutor_update_every: int = 5,
                  mutor_buffer_momentum: float = 0.95,
-                 mutor_bit_divergence_weight: float = 0.3):
+                 mutor_bit_divergence_weight: float = 0.3,
+                 gradient_clipping: float = 1.0):
         self.model = model.to(device)
         self.device = device
         self.grad_accum_steps = grad_accum_steps
         self.mutor_mode = mutor_mode
 
-        print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\nModel params - Total: {total_params:,}, Trainable: {trainable_params:,} ({trainable_params/total_params:.2%})")
 
         print("\nModel architecture:")
         print(model)
 
-        output = model.generate("Test", max_len=20)
-        print(f"\nGenerated (untrained): {output}")
+        output = model.generate("The ", max_len=20)
+        print(f"\nGenerated: {output}")
 
-        self.metrics = StreamingGrokMetrics(alpha=ema_alpha)
+        self.metrics = StreamingGrokMetrics(alpha_slow=ema_alpha)
 
         # Optimizer with weight decay on everything except biases and norm gains
         # Robustly exclude RMSNorm (scale/shift), LayerNorm weights, and any biases
@@ -1293,8 +1379,8 @@ class Trainer:
                 '.norm' in name or
                 name.endswith('.scale') or
                 name.endswith('.shift') or
-                'register_embedding' in name or  # Add this
-                'offset_embeddings' in name):     # Add this
+                'register_embedding' in name or
+                'offset_embeddings' in name):
                 no_decay_names.add(name)
             else:
                 decay_names.add(name)
@@ -1303,10 +1389,14 @@ class Trainer:
         # print(f"no_decay_names: {no_decay_names}\n")
 
         param_groups = [
-            {'params': [p for n, p in model.named_parameters() if n in decay_names],
-             'weight_decay': weight_decay},
-            {'params': [p for n, p in model.named_parameters() if n in no_decay_names],
-             'weight_decay': 0.0}
+            {
+                'params': [p for n, p in model.named_parameters() if n in decay_names],
+                'weight_decay': weight_decay
+            },
+            {
+                'params': [p for n, p in model.named_parameters() if n in no_decay_names],
+                'weight_decay': 0.0
+            }
         ]
 
         self.train_loss = None
@@ -1317,8 +1407,10 @@ class Trainer:
         self.opt = GrokAdamW(
             param_groups,
             lr=lr,
+            betas=[0.8, 0.95],
             weight_decay=weight_decay,
-            grokking_signal_fns=[lambda: self.metrics.get_signal()]
+            grokking_signal_fns=[lambda: self.metrics.get_signal()],
+            gradient_clipping=gradient_clipping
         )
 
         # OneCycle schedule with proper total steps and warmup fraction
@@ -1331,7 +1423,7 @@ class Trainer:
         )
 
         # Mixed precision
-        self.scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
+        self.scaler = torch.amp.GradScaler('cuda') if device == 'cuda' else None
 
         self.step = 0
 
@@ -1429,12 +1521,7 @@ class Trainer:
         targets = batch[:, 1:]
 
         with self.autocast_ctx:
-            if use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0 and self.mutor_mode == 'dense':
-                # Legacy dense MuToR path
-                aug_batch, positions, is_register, aug_targets = mutor_augment_batch(inputs, targets, self.model, self.device)
-                logits = self.model(aug_batch, positions=positions, is_register=is_register)
-                loss = compute_mutor_loss(logits, aug_targets, is_register, self.encoder.PAD, alpha=self.model.mutor_alpha)
-            elif use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0 and self.mutor_mode == 'entropy' and self.mutor_controller is not None:
+            if use_mutor and getattr(self.model, 'mutor_dmax', 0) > 0 and self.mutor_mode == 'entropy' and self.mutor_controller is not None:
                 # Entropy-guided single-stream sparse MuToR
                 B, L = inputs.shape
                 # Early features for difficulty
@@ -1559,15 +1646,20 @@ class Trainer:
         actual_loss = loss.item() * self.grad_accum_steps
         self.metrics.update_train(actual_loss)
 
+        if self.step % 100 == 0 and hasattr(self.metrics, 'phase'):
+            phase_info = f"[{self.metrics.phase}] v={self.metrics.eval_velocity:.4f} a={self.metrics.eval_accel:.5f}"
+            if self.metrics.phase == 'grokking':
+                print(f"🚀 GROKKING DETECTED! {phase_info}")
+
         # Optimizer step
         if (self.step + 1) % self.grad_accum_steps == 0:
             if self.scaler:
                 self.scaler.unscale_(self.opt)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.opt)
                 self.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.opt.step()
 
             self.opt.zero_grad(set_to_none=True)
@@ -2079,15 +2171,19 @@ def train(
                     trainer.quick_eval_update(val_batch)
                 pbar.set_postfix({
                     'loss': f"{loss:.4f}",
-                    'train_ema': f"{trainer.metrics.train_loss_ema:.4f}" if trainer.metrics.train_loss_ema else "N/A",
-                    'eval_ema': f"{trainer.metrics.eval_loss_ema:.4f}" if trainer.metrics.eval_loss_ema else "N/A",
+                    'train/slow': f"{trainer.metrics.train_slow:.4f}" if trainer.metrics.train_slow else "N/A",
+                    'train/fast': f"{trainer.metrics.train_fast:.4f}" if trainer.metrics.train_fast else "N/A",
+                    'eval/slow': f"{trainer.metrics.eval_slow:.4f}" if trainer.metrics.eval_slow else "N/A",
+                    'eval/fast': f"{trainer.metrics.eval_fast:.4f}" if trainer.metrics.eval_fast else "N/A",
                     'perp': f"{trainer.metrics.perp_ema:.2f}" if trainer.metrics.perp_ema else "N/A",
                     'grok': f"{trainer.metrics.get_signal():.3f}"
                 })
                 run.log({
                     'train/loss': loss,
-                    'train/ema': trainer.metrics.train_loss_ema,
-                    'validation/ema': trainer.metrics.eval_loss_ema,
+                    'train/ema_slow': trainer.metrics.train_slow,
+                    'train/ema_fast': trainer.metrics.train_fast,
+                    'validation/ema_slow': trainer.metrics.eval_slow,
+                    'validation/ema_fast': trainer.metrics.eval_fast,
                     'perplexity/ema': trainer.metrics.perp_ema,
                     'grok': trainer.metrics.get_signal()
                 })
@@ -2107,8 +2203,8 @@ def train(
                 avg_eval_loss = np.mean(eval_losses)
                 epoch_perplexity = math.exp(min(avg_eval_loss, 20))
                 print(f"\n{stage_name} Epoch {epoch+1} Summary:")
-                print(f"  Streaming - Train EMA: {trainer.metrics.train_loss_ema:.4f}, "
-                      f"Eval EMA: {trainer.metrics.eval_loss_ema:.4f}, "
+                print(f"  Streaming - Train EMA: {trainer.metrics.train_slow:.4f}, "
+                      f"Eval EMA: {trainer.metrics.eval_slow:.4f}, "
                       f"Perp EMA: {trainer.metrics.perp_ema:.2f}")
                 print(f"  Full Eval - Loss: {avg_eval_loss:.4f}, Perplexity: {epoch_perplexity:.2f}")
                 print(f"  Grokking Signal: {trainer.metrics.get_signal():.3f}")
@@ -2221,8 +2317,9 @@ def run_test_generations(model: XOR8BitLM, input_text: str, max_len: int = 512):
 
 if __name__ == "__main__":
 
-    test_run = False
+    test_run = True
     load_and_test = False
+    test_run_shakespeare = False
 
     if load_and_test:
         model = load_model("xor_model", "mps")
@@ -2230,34 +2327,68 @@ if __name__ == "__main__":
         exit()
 
     if test_run:
-        input_text = """
-ALL:
-Content, content.
+        if test_run_shakespeare:
+            input_text = """
+    ALL:
+    Content, content.
 
-MENENIUS:
-O sir, you are not right: have you not known
-The worthiest men have done't?
+    MENENIUS:
+    O sir, you are not right: have you not known
+    The worthiest men have done't?
 
-CORIOLANUS:
-""".strip()
+    CORIOLANUS:
+    """.strip()
 
-        model = train(
-            "data/tiny_shakespeare.txt",
-            seq_length=512,
-            batch_size=8,
+            model = train(
+                "data/tiny_shakespeare.txt",
+                seq_length=512,
+                batch_size=8,
+                epochs=5,
+                d_model=512,
+                n_heads=8,
+                n_layers=8,
+                rope_base=10000,
+                test_prompt="The "
+            )
+
+            output = model.generate_with_cache(input_text, max_len=200)
+            print(f"\nGenerated:\n{output}")
+
+        else:
+            model = train(
+            "datasets/packed",
+            model_path="xor_test",
+            seq_length=564,
+            batch_size=4,
             epochs=5,
             d_model=512,
             n_heads=8,
             n_layers=8,
             rope_base=10000,
-            test_prompt="The "
+            test_prompt="The ",
+            mixing_policy='round_robin_wrap',
+            curriculum=[
+                {
+                    'name': 'pretrain',
+                    'packed_roots': [
+                        'datasets/packed/tiny-stories-512',
+                    ],
+                    'epochs': 1,
+                    #'steps': 5000,
+                    'lr': 3e-4
+                },
+                {
+                    'name': 'school',
+                    'packed_roots': [
+                        'datasets/packed/orca-inst-512',
+                    ],
+                    'epochs': 1,
+                    #'steps': 4000,
+                    'lr': 5e-5
+                }
+            ]
         )
-
-        output = model.generate_with_cache(input_text, max_len=200)
-        print(f"\nGenerated:\n{output}")
     else:
-
-        # Train example (uncomment to run)
         model = train(
             "datasets/packed",
             seq_length=3096,

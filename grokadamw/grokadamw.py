@@ -112,8 +112,10 @@ class GrokAdamW(Optimizer):
 
         # Compute grokking alpha once outside loop
         alpha = group['alpha_init']
-        if grokking_signal is not None:
-            alpha = alpha * math.exp(-group['grokking_signal_decay_rate'] * grokking_signal)
+        if grokking_signal is not None and grokking_signal > 0.3:
+            # Sharper response to strong grokking signals
+            decay_factor = group['grokking_signal_decay_rate'] * (1 + grokking_signal * 2)
+            alpha = alpha * math.exp(-decay_factor * grokking_signal)
 
         # Batch gradient clipping for all parameters at once (MPS optimization)
         if group['gradient_clipping'] > 0:
