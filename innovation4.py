@@ -2030,12 +2030,13 @@ def train(
         effective_total = planned_total if stage_steps is None else min(planned_total, int(stage_steps))
         print(f"[stage] {stage_name}: steps_per_epoch={steps_per_epoch}, planned_total={planned_total}, effective_total={effective_total}")
 
+        bit_divergence_weight = mutor_bit_divergence_weight
 
         if stage_name == 'school':
             # Freeze lower layers and bit projection
             n_freeze = int(len(model.layers) * 0.6)  # Freeze 60% of layers
 
-            mutor_bit_divergence_weight = 0.25
+            bit_divergence_weight = 0.25
 
             # Freeze bit projection
             model.bit_proj.weight.requires_grad = False
@@ -2061,7 +2062,7 @@ def train(
             mutor_min_spacing=mutor_min_spacing,
             mutor_update_every=mutor_update_every,
             mutor_buffer_momentum=mutor_buffer_momentum,
-            mutor_bit_divergence_weight=mutor_bit_divergence_weight,
+            mutor_bit_divergence_weight=bit_divergence_weight,
         )
 
         val_iter = itertools.cycle(stage_val_loader)
@@ -2259,7 +2260,7 @@ CORIOLANUS:
         # Train example (uncomment to run)
         model = train(
             "datasets/packed",
-            seq_length=3072,
+            seq_length=3096,
             batch_size=4,
             epochs=5,
             d_model=512,
@@ -2267,6 +2268,7 @@ CORIOLANUS:
             n_layers=8,
             rope_base=10000,
             test_prompt="The ",
+            mixing_policy='round_robin_wrap',
             curriculum=[
                 {
                     'name': 'pretrain',
@@ -2275,9 +2277,11 @@ CORIOLANUS:
                         'datasets/packed/orca-pre',
                         'datasets/packed/tiny-lessons',
                         'datasets/packed/tiny-textbooks',
-                        'datasets/packed/tiny-superwiki'
+                        'datasets/packed/tiny-superwiki',
+                        'datasets/packed/arxiver'
                     ],
-                    'epochs': 1,
+                    #'epochs': 1,
+                    'steps': 5000,
                     'lr': 3e-4
                 },
                 {
@@ -2286,7 +2290,7 @@ CORIOLANUS:
                         'datasets/packed/orca-inst',
                     ],
 
-                    'steps': 2000,
+                    'steps': 4000,
                     'lr': 5e-5
                 }
             ]

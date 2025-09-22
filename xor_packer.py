@@ -472,6 +472,9 @@ def pack_hf_qwen_with_masks(
                     text = ex.get('text', None)
 
                 if text is None:
+                    text = ex.get('markdown', None)
+
+                if text is None:
                     continue
                 body = np.frombuffer(str(text).encode('utf-8', errors='ignore'), dtype=np.uint8)
                 seg = encoder.gray_lut[body].astype(np.uint16, copy=False)

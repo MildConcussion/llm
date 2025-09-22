@@ -164,6 +164,8 @@ class MixedPackedXORDataset(Dataset):
     """
     Combine multiple shard datasets with configurable mixing:
     - policy='round_robin': equalize across datasets in cyclic order until shortest exhausts.
+    - policy='round_robin_wrap': cyclic order using wrap-around until all datasets are exhausted
+      (uses all windows; interleaves fairly without truncation).
     - policy='weighted': approximate proportion using weights; length equals sum of lengths
       of all datasets (with replacement sampling).
     """
@@ -196,6 +198,28 @@ class MixedPackedXORDataset(Dataset):
                 for ds_idx, ds_len in enumerate(lens):
                     order.append((ds_idx, i))
             self.index = order
+            # minimal debug
+            print(f"[mix] policy=round_robin lens={lens} total={len(self.index)}")
+        elif self.policy == 'round_robin_wrap':
+            # Cycle with wrap-around until all items from all datasets are consumed
+            lens = [len(ds) for ds in self.datasets]
+            total = int(sum(lens))
+            counters = [0] * len(self.datasets)
+            order = []
+            produced = 0
+            while produced < total:
+                made_progress = False
+                for ds_idx, L in enumerate(lens):
+                    if counters[ds_idx] < L:
+                        order.append((ds_idx, counters[ds_idx]))
+                        counters[ds_idx] += 1
+                        produced += 1
+                        made_progress = True
+                if not made_progress:
+                    break
+            self.index = order
+            # minimal debug
+            print(f"[mix] policy=round_robin_wrap lens={lens} total={len(self.index)}")
         elif self.policy == 'weighted':
             lens = [len(ds) for ds in self.datasets]
             total = int(sum(lens))
@@ -212,6 +236,8 @@ class MixedPackedXORDataset(Dataset):
                 local_idx = counters[ds_idx] % len(self.datasets[ds_idx])
                 self.index.append((int(ds_idx), int(local_idx)))
                 counters[ds_idx] += 1
+            # minimal debug
+            print(f"[mix] policy=weighted lens={lens} total={len(self.index)}")
         else:
             raise ValueError(f"Unknown mixing policy: {self.policy}")
 
