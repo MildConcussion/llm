@@ -11,7 +11,7 @@ class GrokAdamW(Optimizer):
     def __init__(self, params: Iterable[torch.Tensor], lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999),
                  eps: float = 1e-8, weight_decay: float = 1e-2, alpha_init: float = 0.98, lamb: float = 2.0,
                  gamma: float = 0.1, grokking_signal_fns: Optional[list[Callable[[], float]]] = None,
-                 grokking_signal_decay_rate: float = 0.1, gradient_clipping: float = 1.0):
+                 grokking_signal_decay_rate: float = 0.1, gradient_clipping: float = 1.0, alpha_min: Optional[float] = None):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -32,7 +32,7 @@ class GrokAdamW(Optimizer):
                         alpha_init=alpha_init, lamb=lamb, gamma=gamma,
                         grokking_signal_fns=grokking_signal_fns,
                         grokking_signal_decay_rate=grokking_signal_decay_rate,
-                        gradient_clipping=gradient_clipping)
+                        gradient_clipping=gradient_clipping, alpha_min=alpha_init * 0.6 if alpha_min is None else alpha_min)
         super(GrokAdamW, self).__init__(params, defaults)
 
     def _get_device(self, params):

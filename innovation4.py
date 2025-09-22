@@ -1178,6 +1178,209 @@ class StreamingGrokMetrics:
 
         return float(self.signal_ema)
 
+
+class MultiGrokOptimizer:
+    """Single unified optimizer managing multiple component-specific optimizers."""
+
+    COMPONENT_CONFIG = {
+        'embeddings': {'lr_scale': 1.0, 'weight_decay': 0.01, 'optimizer': 'adamw', 'grok': False},
+        'attention': {'lr_scale': 0.8, 'weight_decay': 0.01, 'optimizer': 'grokadamw', 'grok': True, 'gradient_clipping': 0.25},
+        'ffn': {'lr_scale': 1.2, 'weight_decay': 0.01, 'optimizer': 'grokadamw', 'grok': True, 'grok_scale': 1.2, 'gradient_clipping': 1.0},
+        'biases': {'lr_scale': 2.0, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False},
+        'layer_norm': {'lr_scale': 1.5, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False},
+        'tau': {'lr_scale': 0.1, 'weight_decay': 0.0, 'optimizer': 'adam', 'grok': False},
+        'bit_proj': {'lr_scale': 0.5, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False},
+        'output': {'lr_scale': 0.3, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False, 'gradient_clipping': 0.1},
+    }
+
+    def __init__(self, model, base_lr=3e-4, weight_decay=0.01, gradient_clipping=1.0):
+        self.model = model
+        self.base_lr = base_lr
+        self.weight_decay = weight_decay
+        self.gradient_clipping = gradient_clipping
+
+        # Extract number of layers from model
+        self.n_layers = len(self.model.layers)
+
+        # Regex patterns for parameter parsing
+        import re
+        self.patterns = {
+            'layer_idx': re.compile(r'layers\.(\d+)\.')
+        }
+
+        # Single pass parameter classification
+        self.param_groups = self._classify_parameters()
+
+        # Create optimizers
+        self.optimizers = {}
+        self.grok_signals = {}
+        self._create_optimizers()
+
+        # Unified gradient clipping handle
+        self.all_params = [p for group in self.param_groups.values() for p in group['params']]
+
+        # Map parameters to layer indices once
+        self._param_layer_map = self._build_param_layer_map()
+
+    def _build_param_layer_map(self):
+        """Build parameter -> layer index mapping."""
+        param_to_layer = {}
+        for name, param in self.model.named_parameters():
+            if 'layers.' in name:
+                match = self.patterns['layer_idx'].search(name)
+                if match:
+                    layer_idx = int(match.group(1))
+                    param_to_layer[id(param)] = layer_idx
+        return param_to_layer
+
+    def _classify_parameters(self):
+        """Single pass to classify all parameters by optimal component grouping."""
+        groups = {}
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Priority-based component classification (biases override everything)
+            if 'tau' in name:
+                component = 'tau'
+            elif 'bit_proj' in name:
+                component = 'bit_proj'
+            elif name.endswith('.bias'):
+                component = 'biases'
+            elif 'norm' in name or 'scale' in name or 'shift' in name:
+                component = 'layer_norm'
+            elif any(x in name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'in_proj', 'out_proj']):
+                component = 'attention'
+            elif any(x in name for x in ['fc1', 'fc2', 'fc3', 'ffn']):
+                component = 'ffn'
+            elif 'out' in name:
+                component = 'output'
+            elif 'embedding' in name or 'offset_embeddings' in name:
+                component = 'embeddings'
+            else:
+                # Default to embeddings for unmatched parameters (like position embeddings, etc.)
+                component = 'embeddings'
+
+            # Get component config
+            config = self.COMPONENT_CONFIG[component]
+
+            # Use weight_decay from config (no longer needs_decay logic)
+            weight_decay = config['weight_decay']
+
+            # Create key (component only, since weight_decay is now per-component)
+            key = component
+
+            if key not in groups:
+                groups[key] = {
+                    'params': [],
+                    'weight_decay': weight_decay,
+                    'component': component,
+                    'config': config
+                }
+            groups[key]['params'].append(param)
+
+        return groups
+
+    def _create_optimizers(self):
+        """Create optimizers for each component type."""
+        # Create one optimizer per component
+        for component, group in self.param_groups.items():
+            config = group['config']
+            lr = self.base_lr * config['lr_scale']
+            weight_decay = group['weight_decay']
+
+            # Single param group per component with component-specific weight_decay
+            param_groups = [{
+                'params': group['params'],
+                'weight_decay': weight_decay
+            }]
+
+            if config['optimizer'] == 'grokadamw' and config['grok']:
+                # Layer-aware grok signal
+                signal_fn = self._create_grok_signal(component)
+                self.grok_signals[component] = signal_fn
+                self.optimizers[component] = GrokAdamW(
+                    param_groups,
+                    lr=lr,
+                    grokking_signal_fns=[signal_fn],
+                    gradient_clipping=0,  # Handled externally for component-specific clipping
+                    betas=(0.8, 0.98)
+                )
+            elif config['optimizer'] == 'adamw':
+                self.optimizers[component] = torch.optim.AdamW(
+                    param_groups,
+                    lr=lr,
+                    betas=(0.8, 0.95)
+                )
+            else:  # adam
+                self.optimizers[component] = torch.optim.Adam(
+                    param_groups,
+                    lr=lr,
+                    betas=(0.9, 0.999)
+                )
+
+    def _create_grok_signal(self, component):
+        """Component-specific grok signal factory."""
+        if component == 'ffn':
+            # FFN gets stronger signal for memory grokking
+            return lambda: self.base_grok_signal() * 1.2
+        elif component == 'attention':
+            # Attention gets standard signal
+            return lambda: self.base_grok_signal()
+        else:
+            return lambda: 0.0
+
+    def base_grok_signal(self):
+        """Get base grokking signal from trainer metrics."""
+        # This will be injected from trainer
+        return getattr(self, '_current_grok_signal', 0.0)
+
+    def set_grok_signal(self, signal: float, collect_grads: bool = False):
+        """Set base grok signal with optional gradient collection."""
+        self._grok_signal = signal
+        self._collect_grads = collect_grads and signal > 0.1
+
+    @torch.no_grad()
+    def step(self):
+        """Single step for all optimizers with component-specific gradient clipping."""
+        # Apply component-specific gradient clipping
+        for component, opt in self.optimizers.items():
+            config = self.COMPONENT_CONFIG[component]
+            clipping_threshold = config.get('gradient_clipping', 0)
+
+            if clipping_threshold > 0:
+                # Get all parameters for this component's optimizer
+                params = []
+                for group in opt.param_groups:
+                    params.extend(group['params'])
+                if params:
+                    torch.nn.utils.clip_grad_norm_(params, clipping_threshold)
+
+        # Step all optimizers
+        for opt in self.optimizers.values():
+            opt.step()
+
+    def zero_grad(self, set_to_none=True):
+        """Zero gradients for all optimizers."""
+        for opt in self.optimizers.values():
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        """Unified state dict."""
+        return {
+            f'{component}_opt': opt.state_dict()
+            for component, opt in self.optimizers.items()
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load unified state dict."""
+        for component, opt in self.optimizers.items():
+            key = f'{component}_opt'
+            if key in state_dict:
+                opt.load_state_dict(state_dict[key])
+
+
 class Trainer:
     """Efficient trainer with mixed precision and gradient accumulation."""
 
@@ -1208,66 +1411,22 @@ class Trainer:
         print(f"\nGenerated: {output}")
 
         self.metrics = StreamingGrokMetrics(alpha_slow=ema_alpha)
-
-        # Optimizer with weight decay on everything except biases and norm gains
-        # Robustly exclude RMSNorm (scale/shift), LayerNorm weights, and any biases
-        decay_names = set()
-        no_decay_names = set()
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-              continue  # frozen weights
-            if (len(param.shape) == 1 or
-                "bit_proj" in name or
-                name.endswith('.bias') or
-                '.norm' in name or
-                name.endswith('.scale') or
-                name.endswith('.shift') or
-                'register_embedding' in name or
-                'offset_embeddings' in name):
-                no_decay_names.add(name)
-            else:
-                decay_names.add(name)
-
-        # print(f"\ndecay_names: {decay_names}\n")
-        # print(f"no_decay_names: {no_decay_names}\n")
-
-        param_groups = [
-            {
-                'params': [p for n, p in model.named_parameters() if n in decay_names],
-                'weight_decay': weight_decay
-            },
-            {
-                'params': [p for n, p in model.named_parameters() if n in no_decay_names],
-                'weight_decay': 0.0
-            }
-        ]
-
-        self.train_loss = None
-        self.eval_loss = None
-        self.perplexity = float('inf')
-        self.best_perplexity = float('inf')
-
-        self.opt = GrokAdamW(
-            param_groups,
-            lr=lr,
-            betas=[0.8, 0.95],
-            weight_decay=weight_decay,
-            grokking_signal_fns=[lambda: self.metrics.get_signal()],
-            gradient_clipping=gradient_clipping
-        )
+        self.opt = MultiGrokOptimizer(model, base_lr=lr, weight_decay=0.1)
 
         # OneCycle schedule with proper total steps and warmup fraction
-        if total_steps is None:
-            total_steps = max(warmup_steps * 20, 1000)
-        pct_start = min(max(warmup_steps / total_steps, 1e-6), 0.9)
+        total_steps = total_steps or 10000
+
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.opt, max_lr=lr, total_steps=total_steps,
-            pct_start=pct_start, anneal_strategy='cos'
+            self.opt.optimizers['attention'],  # Use main optimizer for scheduling
+            max_lr=lr,
+            total_steps=total_steps,
+            pct_start=min(warmup_steps/total_steps, 0.9)
         )
 
         # Mixed precision
         self.scaler = torch.amp.GradScaler('cuda') if device == 'cuda' else None
 
+        self.grad_collect_interval = 50
         self.step = 0
 
         # Mixed precision forward (safe across devices)
@@ -1494,21 +1653,20 @@ class Trainer:
         self.metrics.update_train(actual_loss)
 
         # Optimizer step
-        if (self.step + 1) % self.grad_accum_steps == 0:
-            if self.scaler:
-                self.scaler.unscale_(self.opt)
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.scaler.step(self.opt)
-                self.scaler.update()
-            else:
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.opt.step()
+        # self.opt.set_grok_signal(self.metrics.get_signal())
 
+        # Single step for all optimizers
+        if (self.step + 1) % self.grad_accum_steps == 0:
+            signal = self.metrics.get_signal()
+            collect_grads = (self.step % self.grad_collect_interval == 0)
+            self.opt.set_grok_signal(signal, collect_grads=collect_grads)
+
+            self.opt.step()
             self.opt.zero_grad(set_to_none=True)
             self.scheduler.step()
 
         self.step += 1
-        return actual_loss
+        return loss.item()
 
     @torch.no_grad()
     def eval_step(self, batch: torch.Tensor) -> tuple[float, int]:
@@ -1957,18 +2115,6 @@ class DatasetBuilder:
         return stage_train_loader, stage_val_loader
 
 
-def _setup_device_and_autocast(device: str):
-    """Setup device-specific autocast context."""
-    if device == 'cuda':
-        autocast_ctx = torch.amp.autocast(device_type='cuda')
-    elif device == 'cpu':
-        autocast_ctx = torch.amp.autocast(device_type='cpu')
-    else:
-        # MPS or other devices: disable autocast for stability
-        autocast_ctx = contextlib.nullcontext()
-    return autocast_ctx
-
-
 class CurriculumManager:
     """Manages curriculum learning stages and their execution."""
 
@@ -2312,9 +2458,9 @@ if __name__ == "__main__":
             model = train(
             "datasets/packed",
             model_path="xor_test",
-            seq_length=1069,
-            eval_interval=25,
-            batch_size=4,
+            seq_length=590,
+            eval_interval=15,
+            batch_size=8,
             epochs=5,
             d_model=64,
             n_heads=8,
@@ -2328,17 +2474,17 @@ if __name__ == "__main__":
                     'packed_roots': [
                         'datasets/packed/tiny-stories-512',
                     ],
-                    #'epochs': 1,
-                    'steps': 1000,
+                    'epochs': 2,
+                    #'steps': 1000,
                     'lr': 3e-4
                 },
                 {
                     'name': 'school',
                     'packed_roots': [
-                        'datasets/packed/tiny-stories-instruct-1024',
+                        'datasets/packed/tiny-stories-instruct-512',
                     ],
-                    #'epochs': 1,
-                    'steps': 100,
+                    'epochs': 1,
+                    #'steps': 100,
                     'lr': 5e-5
                 }
             ]
