@@ -2362,9 +2362,9 @@ if __name__ == "__main__":
             model = train(
             "datasets/packed",
             model_path="xor_test",
-            seq_length=1069,
+            seq_length=566,
             eval_interval=25,
-            batch_size=8,
+            batch_size=16,
             epochs=5,
             d_model=64,
             n_heads=8,
@@ -2385,7 +2385,7 @@ if __name__ == "__main__":
                 {
                     'name': 'school',
                     'packed_roots': [
-                        'datasets/packed/tiny-stories-instruct-1024',
+                        'datasets/packed/tiny-stories-instruct-512',
                     ],
                     'epochs': 1,
                     #'steps': 4000,
