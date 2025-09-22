@@ -1214,127 +1214,112 @@ class XOR8BitLM(nn.Module):
 # ============= TRAINING =============
 
 class StreamingGrokMetrics:
-    """Enhanced grokking detector with derivatives and phase tracking."""
+    """Minimal, robust grokking detector using scale-free metrics with smoothing."""
 
-    def __init__(self, alpha_slow=0.99, alpha_fast=0.9):
-        # Dual timescales for better transition detection
-        self.alpha_slow = alpha_slow
-        self.alpha_fast = alpha_fast
+    def __init__(self, alpha_slow=0.99, alpha_fast=0.9,
+                 k_loss: float = 3.0, k_perp: float = 2.0, k_improve: float = 4.0,
+                 signal_smooth_alpha: float = 0.9):
+        # EMA timescales
+        self.alpha_slow = float(alpha_slow)
+        self.alpha_fast = float(alpha_fast)
 
-        # Slow EMAs (smooth trends)
+        # Hyperparameters
+        self.k_loss = float(k_loss)
+        self.k_perp = float(k_perp)
+        self.k_improve = float(k_improve)
+        self.signal_smooth_alpha = float(signal_smooth_alpha)
+
+        # Slow/Fast EMAs for train/eval loss
         self.train_slow = None
         self.eval_slow = None
-
-        # Fast EMAs (responsive to changes)
         self.train_fast = None
         self.eval_fast = None
 
-        # Derivative tracking
-        self.eval_prev = None
-        self.eval_velocity = 0.0  # First derivative
-        self.eval_accel = 0.0     # Second derivative
-
-        # Phase tracking
-        self.phase = 'fitting'  # 'fitting', 'memorizing', 'grokking', 'generalized'
-        self.memorization_steps = 0
-        self.grokking_confidence = 0.0
-
+        # Perplexity tracking (EMA) and best tracking (both hard min and slow EMA of best)
         self.perp_ema = None
-        self.best_perp = float('inf')
+        self.best_perp_seen = float('inf')
+        self.best_perp_ema = None  # initialized on first update
+
+        # Improvement (relative change of eval ema) with momentum
+        self.prev_eval_ema = None
+        self.improvement_rate = 0.0
+
+        # Final signal smoothing
+        self.signal_ema = None
 
     def update_train(self, loss: float):
         if self.train_slow is None:
-            self.train_slow = loss
-            self.train_fast = loss
+            self.train_slow = float(loss)
+            self.train_fast = float(loss)
         else:
-            self.train_slow = self.alpha_slow * self.train_slow + (1 - self.alpha_slow) * loss
-            self.train_fast = self.alpha_fast * self.train_fast + (1 - self.alpha_fast) * loss
+            self.train_slow = self.alpha_slow * self.train_slow + (1 - self.alpha_slow) * float(loss)
+            self.train_fast = self.alpha_fast * self.train_fast + (1 - self.alpha_fast) * float(loss)
 
     def update_eval(self, loss: float, perplexity: float):
-        # Update EMAs
+        # Update eval loss EMAs
         if self.eval_slow is None:
-            self.eval_slow = loss
-            self.eval_fast = loss
-            self.eval_prev = loss
-            self.perp_ema = perplexity
+            self.eval_slow = float(loss)
+            self.eval_fast = float(loss)
+            self.prev_eval_ema = float(loss)
+            # Perplexity EMA initializes from provided perplexity
+            self.perp_ema = float(perplexity)
+            self.best_perp_seen = float(perplexity)
+            self.best_perp_ema = float(perplexity)
         else:
-            self.eval_slow = self.alpha_slow * self.eval_slow + (1 - self.alpha_slow) * loss
-            self.eval_fast = self.alpha_fast * self.eval_fast + (1 - self.alpha_fast) * loss
+            self.eval_slow = self.alpha_slow * self.eval_slow + (1 - self.alpha_slow) * float(loss)
+            self.eval_fast = self.alpha_fast * self.eval_fast + (1 - self.alpha_fast) * float(loss)
 
-            # Compute derivatives (normalized by magnitude to handle different scales)
-            new_velocity = loss - self.eval_prev
-            velocity_change = new_velocity - self.eval_velocity
+            # Relative improvement rate (frequency-invariant)
+            if self.prev_eval_ema is not None and self.prev_eval_ema > 0:
+                relative_change = (self.prev_eval_ema - self.eval_slow) / self.prev_eval_ema
+                self.improvement_rate = 0.9 * self.improvement_rate + 0.1 * relative_change
+            self.prev_eval_ema = self.eval_slow
 
-            # Update with momentum for stability
-            self.eval_velocity = 0.9 * self.eval_velocity + 0.1 * new_velocity
-            self.eval_accel = 0.9 * self.eval_accel + 0.1 * velocity_change
-            self.eval_prev = loss
-            self.perp_ema = self.alpha_slow * self.perp_ema + (1 - self.alpha_slow) * perplexity
+            # Perplexity EMA from provided value
+            self.perp_ema = self.alpha_slow * self.perp_ema + (1 - self.alpha_slow) * float(perplexity)
 
-        self.best_perp = min(self.best_perp, perplexity)
-
-        # Update phase state machine
-        self._update_phase()
-
-    def _update_phase(self):
-        """Simple phase detector based on loss patterns."""
-        if self.train_slow is None or self.eval_slow is None:
-            return
-
-        train_converged = self.train_slow < 0.1  # Near zero
-        eval_high = self.eval_slow > 0.5  # Still struggling
-        eval_dropping = self.eval_velocity < -0.01  # Improving
-        eval_accelerating = self.eval_accel < -0.001  # Improving faster
-
-        prev_phase = self.phase
-
-        if not train_converged:
-            self.phase = 'fitting'
-            self.memorization_steps = 0
-        elif train_converged and eval_high and not eval_dropping:
-            self.phase = 'memorizing'
-            self.memorization_steps += 1
-        elif train_converged and eval_dropping and self.memorization_steps > 10:
-            # Key insight: require prior memorization before declaring grokking
-            if eval_accelerating:
-                self.phase = 'grokking'
-                self.grokking_confidence = min(1.0, self.grokking_confidence + 0.1)
-            else:
-                self.phase = 'grokking'
-                self.grokking_confidence = min(1.0, self.grokking_confidence + 0.05)
-        elif self.eval_slow < 0.3 and abs(self.eval_velocity) < 0.005:
-            self.phase = 'generalized'
-
-        # Log phase transitions
-        if prev_phase != self.phase:
-            print(f"[Phase transition] {prev_phase} → {self.phase}")
+            # Best tracking: hard min and slow EMA toward best
+            self.best_perp_seen = min(self.best_perp_seen, self.perp_ema)
+            best_beta = 0.99
+            self.best_perp_ema = best_beta * self.best_perp_ema + (1 - best_beta) * self.best_perp_seen
 
     def get_signal(self) -> float:
-        """Clean, interpretable grokking signal based on phase and dynamics."""
+        """Scale-free grokking signal based on ratios and relative improvements."""
         if self.train_slow is None or self.eval_slow is None:
             return 0.0
 
-        # Core signal: Are we memorized but not generalized?
-        memorized = float(self.train_slow < 0.1)
-        gap = max(0, self.eval_slow - self.train_slow) / max(self.eval_slow, 0.1)
+        eps = 1e-8
 
-        # Boost signal during active grokking (negative acceleration = improvement)
-        improvement_rate = max(0, -self.eval_velocity * 10)  # Scale for visibility
-        acceleration_bonus = max(0, -self.eval_accel * 50)
+        # Loss ratio signal (eval vs train)
+        loss_ratio = self.eval_slow / max(self.train_slow, eps)
+        loss_gap_signal = max(0.0, min(1.0, (loss_ratio - 1.0) / max(self.k_loss, eps)))
 
-        # Phase-aware combination
-        if self.phase == 'memorizing':
-            # High signal: we're stuck memorizing
-            return memorized * gap * 0.8
-        elif self.phase == 'grokking':
-            # Very high signal: active grokking happening!
-            return min(1.0, memorized * (gap + improvement_rate + acceleration_bonus))
-        elif self.phase == 'generalized':
-            # Low signal: we've succeeded
-            return 0.1
-        else:  # fitting
-            # Medium signal during initial fitting
-            return gap * 0.3
+        # Perplexity ratio signal (current vs best-ema)
+        perp_signal = 0.0
+        if self.perp_ema is not None and self.best_perp_ema is not None and self.best_perp_ema > 0:
+            perp_ratio = self.perp_ema / max(self.best_perp_ema, eps)
+            perp_signal = max(0.0, min(1.0, (perp_ratio - 1.0) / max(self.k_perp, eps)))
+
+        # Improvement bonus (relative rate)
+        improvement_bonus = max(0.0, self.improvement_rate * self.k_improve)
+
+        # Fast vs slow divergence (positive when fast < slow during improvements)
+        divergence = 0.0
+        if self.eval_fast is not None and self.eval_slow > 0:
+            divergence = max(0.0, (self.eval_slow - self.eval_fast) / max(self.eval_slow, eps))
+
+        # Combine and smooth
+        base_signal = 0.6 * loss_gap_signal + 0.4 * perp_signal
+        dynamic_signal = min(0.5, improvement_bonus + 2.0 * divergence)
+        signal_raw = min(1.0, base_signal + dynamic_signal)
+
+        if self.signal_ema is None:
+            self.signal_ema = signal_raw
+        else:
+            a = self.signal_smooth_alpha
+            self.signal_ema = a * self.signal_ema + (1 - a) * signal_raw
+
+        return float(self.signal_ema)
 
 class Trainer:
     """Efficient trainer with mixed precision and gradient accumulation."""
@@ -1348,7 +1333,8 @@ class Trainer:
                  mutor_update_every: int = 5,
                  mutor_buffer_momentum: float = 0.95,
                  mutor_bit_divergence_weight: float = 0.3,
-                 gradient_clipping: float = 1.0):
+                 gradient_clipping: float = 1.0,
+                 quick_eval_k: int = 4):
         self.model = model.to(device)
         self.device = device
         self.grad_accum_steps = grad_accum_steps
@@ -1437,6 +1423,9 @@ class Trainer:
             autocast_ctx = contextlib.nullcontext()
 
         self.autocast_ctx = autocast_ctx
+
+        # Mini-eval averaging to reduce variance
+        self.quick_eval_k = max(1, int(quick_eval_k))
 
         # Entropy MuToR controller (single-stream sparse)
         self.mutor_controller: EntropyMuToRController | None = None
@@ -1646,11 +1635,6 @@ class Trainer:
         actual_loss = loss.item() * self.grad_accum_steps
         self.metrics.update_train(actual_loss)
 
-        if self.step % 100 == 0 and hasattr(self.metrics, 'phase'):
-            phase_info = f"[{self.metrics.phase}] v={self.metrics.eval_velocity:.4f} a={self.metrics.eval_accel:.5f}"
-            if self.metrics.phase == 'grokking':
-                print(f"🚀 GROKKING DETECTED! {phase_info}")
-
         # Optimizer step
         if (self.step + 1) % self.grad_accum_steps == 0:
             if self.scaler:
@@ -1702,12 +1686,28 @@ class Trainer:
             return 0.0, 0
 
     def quick_eval_update(self, val_batch: torch.Tensor):
-        """Fast single-batch evaluation for streaming metrics."""
+        """Fast single-batch evaluation for streaming metrics (backward compatible)."""
         self.model.eval()
         loss, n_tokens = self.eval_step(val_batch)
         if n_tokens > 0:
             perplexity = math.exp(min(loss, 20))
             self.metrics.update_eval(loss, perplexity)
+        self.model.train()
+
+    def quick_eval_update_many(self, batches: List[torch.Tensor]):
+        """Evaluate on multiple mini-batches and update metrics with weighted average."""
+        self.model.eval()
+        total_loss_times_tokens = 0.0
+        total_tokens = 0
+        for b in batches:
+            loss, n_tokens = self.eval_step(b)
+            if n_tokens > 0:
+                total_loss_times_tokens += float(loss) * int(n_tokens)
+                total_tokens += int(n_tokens)
+        if total_tokens > 0:
+            avg_loss = total_loss_times_tokens / max(1, total_tokens)
+            perplexity = math.exp(min(avg_loss, 20))
+            self.metrics.update_eval(avg_loss, perplexity)
         self.model.train()
 
     @property
@@ -2126,7 +2126,7 @@ def train(
 
         if stage_name == 'school':
             # Freeze lower layers and bit projection
-            n_freeze = int(len(model.layers) * 0.6)  # Freeze 60% of layers
+            n_freeze = int(len(model.layers) * 0.8)  # Freeze 60% of layers
 
             bit_divergence_weight = 0.25
 
@@ -2167,8 +2167,12 @@ def train(
                 loss = trainer.train_step(train_batch)
                 global_step += 1
                 if global_step % eval_interval == 0:
-                    val_batch = next(val_iter)
-                    trainer.quick_eval_update(val_batch)
+                    if getattr(trainer, 'quick_eval_k', 1) <= 1:
+                        val_batch = next(val_iter)
+                        trainer.quick_eval_update(val_batch)
+                    else:
+                        batches = list(itertools.islice(val_iter, int(trainer.quick_eval_k)))
+                        trainer.quick_eval_update_many(batches)
                 pbar.set_postfix({
                     'loss': f"{loss:.4f}",
                     'train/slow': f"{trainer.metrics.train_slow:.4f}" if trainer.metrics.train_slow else "N/A",
@@ -2361,9 +2365,9 @@ if __name__ == "__main__":
             seq_length=564,
             batch_size=4,
             epochs=5,
-            d_model=512,
+            d_model=64,
             n_heads=8,
-            n_layers=8,
+            n_layers=6,
             rope_base=10000,
             test_prompt="The ",
             mixing_policy='round_robin_wrap',

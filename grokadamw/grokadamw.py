@@ -110,12 +110,23 @@ class GrokAdamW(Optimizer):
         lamb = group['lamb']
         gamma = group['gamma']
 
-        # Compute grokking alpha once outside loop
+        # Compute grokking alpha once outside loop using smoothed bounded signal
         alpha = group['alpha_init']
-        if grokking_signal is not None and grokking_signal > 0.3:
-            # Sharper response to strong grokking signals
-            decay_factor = group['grokking_signal_decay_rate'] * (1 + grokking_signal * 2)
-            alpha = alpha * math.exp(-decay_factor * grokking_signal)
+        if grokking_signal is not None:
+            # Clamp input signal to [0,1]
+            sig = max(0.0, min(1.0, float(grokking_signal)))
+            # Smooth the signal per param group
+            prev_signal = group.get('signal_ema', 0.0)
+            if prev_signal > 0.0:
+                sig_smooth = 0.9 * prev_signal + 0.1 * sig
+            else:
+                sig_smooth = sig
+            group['signal_ema'] = sig_smooth
+
+            # Linear decay bounded by alpha_min
+            decay_strength = group.get('grokking_signal_decay_rate', 0.1) * sig_smooth
+            alpha_min = group.get('alpha_min', group['alpha_init'] * 0.6)
+            alpha = max(alpha_min, group['alpha_init'] * (1.0 - decay_strength))
 
         # Batch gradient clipping for all parameters at once (MPS optimization)
         if group['gradient_clipping'] > 0:
