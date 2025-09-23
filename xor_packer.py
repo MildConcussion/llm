@@ -391,7 +391,7 @@ def pack_hf_qwen_with_masks(
             if '<|endoftext|>' in text:
                 stories.append(current_story)
                 current_story = []
-                if len(stories) >= 100000:
+                if len(stories) >= 1000000:
                     break
         print(f"[tiny_stories] grouped {len(stories)} complete stories from {len(ds)} rows")
         ds = stories  # Replace dataset with grouped stories

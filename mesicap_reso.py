@@ -16,9 +16,9 @@ import json
 import contextlib
 from tqdm import tqdm
 from grokadamw import GrokAdamW
-from xor_packed import PackedXORShardDataset, MixedPackedXORDataset, discover_shards
-from xor_packed import ensure_train_val_split, build_mixed_dataset
-from xor_packed import build_capped_mixed_dataset
+from triadic_packed import MixedPackedTriadicDataset, PackedTriadicShardDataset, discover_shards
+from triadic_packed import ensure_train_val_split, build_mixed_dataset
+from triadic_packed import build_capped_mixed_dataset
 from triadictokenizer import TriadicEncoder
 
 import os
@@ -296,8 +296,13 @@ class XORDataset(Dataset):
         else:
             raise ValueError(f"Unsupported file type: {data_path}")
 
-        # Encode entire text
-        self.data = self.encoder.encode(text)
+        # Encode entire text and normalize to NumPy int64 to avoid NumPy 2.0 copy kw warnings
+        encoded = self.encoder.encode(text)
+        if isinstance(encoded, torch.Tensor):
+            encoded = encoded.detach().cpu().numpy()
+        elif not isinstance(encoded, np.ndarray):
+            encoded = np.asarray(encoded)
+        self.data = encoded.astype(np.int64, copy=False)
 
         # Calculate number of sequences
         self.n_sequences = max(1, (len(self.data) - self.seq_length) // self.stride + 1)
@@ -793,8 +798,7 @@ class MesicapLM(nn.Module):
 
         self.norm = RMSNorm(d_model)
 
-        # Output head (now 260 including REGISTER)
-        self.out = nn.Linear(d_model, len(self.encoder), dtype=dtype)
+        self.out = nn.Linear(d_model, len(self.encoder), dtype=dtype, bias=False)
 
         # Initialize weights
         self.apply(_init_weights_standard)
@@ -911,8 +915,8 @@ class MesicapLM(nn.Module):
         if apply_chat_template:
             system_preface = "You are Kulles, created by Rasmus. You are a helpful assistant."
             base_segs = [
-                self.encoder._encode_qwen_message('system', system_preface),
-                self.encoder._encode_qwen_message('user', prompt)
+                self.encoder.encode_qwen_message('system', system_preface),
+                self.encoder.encode_qwen_message('user', prompt)
             ]
             parts = [np.array([self.encoder.START], dtype=np.uint16)]
             parts.extend(base_segs)
@@ -926,7 +930,18 @@ class MesicapLM(nn.Module):
 
         if len(seq) > 0 and seq[-1] == self.encoder.END:
             seq = seq[:-1]
-        x = torch.from_numpy(seq).long().unsqueeze(0).to(device)
+        # Normalize seq to Tensor (supports numpy, tensor, list); add debug print if requested
+        if isinstance(seq, torch.Tensor):
+            x = seq.to(device=device, dtype=torch.long).unsqueeze(0)
+        else:
+            if not isinstance(seq, np.ndarray):
+                seq = np.array(seq, dtype=np.int64)
+            x = torch.as_tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
+        if debug:
+            try:
+                print(f"[generate] seq_type={type(seq).__name__}, x_shape={tuple(x.shape)}, device={x.device}")
+            except Exception:
+                pass
 
         if not use_cache:
             # Simple generation without cache
@@ -1030,9 +1045,9 @@ class StreamingGrokMetrics:
     """Minimal, robust grokking detector using scale-free metrics with smoothing."""
 
     def __init__(self, alpha_slow=0.99, alpha_fast=0.9,
-                 k_loss: float = 3.0, k_perp: float = 2.0, k_improve: float = 4.0,
-                 signal_smooth_alpha: float = 0.9, train_loss_boost_factor: float = 2.0,
-                 eval_fast_penalty_threshold: float = 1.5, eval_fast_penalty_factor: float = 0.5):
+                 k_loss: float = 3.0, k_perp: float = 2.0, k_improve: float = 5.0,
+                 signal_smooth_alpha: float = 0.9,
+                 train_fast_weight_threshold: float = 0.2, train_fast_weight_max_penalty: float = 0.4):
         # EMA timescales
         self.alpha_slow = float(alpha_slow)
         self.alpha_fast = float(alpha_fast)
@@ -1042,9 +1057,8 @@ class StreamingGrokMetrics:
         self.k_perp = float(k_perp)
         self.k_improve = float(k_improve)
         self.signal_smooth_alpha = float(signal_smooth_alpha)
-        self.train_loss_boost_factor = float(train_loss_boost_factor)
-        self.eval_fast_penalty_threshold = float(eval_fast_penalty_threshold)
-        self.eval_fast_penalty_factor = float(eval_fast_penalty_factor)
+        self.train_fast_weight_threshold = float(train_fast_weight_threshold)
+        self.train_fast_weight_max_penalty = float(train_fast_weight_max_penalty)
 
         # Slow/Fast EMAs for train/eval loss
         self.train_slow = None
@@ -1130,6 +1144,16 @@ class StreamingGrokMetrics:
         dynamic_signal = min(0.5, improvement_bonus + 2.0 * divergence)
         signal_raw = min(1.0, base_signal + dynamic_signal)
 
+        # Apply train_fast weight penalty: higher signal gets lower weight when train_fast > threshold
+        if self.train_fast is not None:
+            if self.train_fast > self.train_fast_weight_threshold:
+                # Calculate penalty factor: 1.0 at threshold, decreasing to max_penalty at train_fast >= 1.0
+                penalty_range = max(0.0, self.train_fast - self.train_fast_weight_threshold)
+                max_penalty_range = 1.0 - self.train_fast_weight_threshold
+                penalty_factor = 1.0 - (penalty_range / max_penalty_range) * self.train_fast_weight_max_penalty
+                penalty_factor = max(0.0, min(1.0, penalty_factor))
+                signal_raw *= penalty_factor
+
         if self.signal_ema is None:
             self.signal_ema = signal_raw
         else:
@@ -1144,13 +1168,13 @@ class MultiGrokOptimizer:
 
     COMPONENT_CONFIG = {
         'embeddings': {'lr_scale': 1.0, 'weight_decay': 0.01, 'optimizer': 'adamw', 'grok': False},
-        'attention': {'lr_scale': 0.8, 'weight_decay': 0.01, 'optimizer': 'grokadamw', 'grok': True, 'gradient_clipping': 0.25},
-        'ffn': {'lr_scale': 1.2, 'weight_decay': 0.01, 'optimizer': 'grokadamw', 'grok': True, 'grok_scale': 1.2, 'gradient_clipping': 1.0},
+        'attention': {'lr_scale': 0.8, 'weight_decay': 0.01, 'optimizer': 'grokadamw', 'grok': True, 'gradient_clipping': 0.5},
+        'ffn': {'lr_scale': 1.2, 'weight_decay': 0.01, 'optimizer': 'grokadamw', 'grok': True, 'grok_scale': 1.2, 'gradient_clipping': 2.0},
         'biases': {'lr_scale': 2.0, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False},
         'layer_norm': {'lr_scale': 1.5, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False},
-        'tau': {'lr_scale': 0.1, 'weight_decay': 0.0, 'optimizer': 'adam', 'grok': False, 'gradient_clipping': 0.2},
+        'tau': {'lr_scale': 0.1, 'weight_decay': 0.0, 'optimizer': 'adam', 'grok': False, 'gradient_clipping': 0.4},
         'bit_proj': {'lr_scale': 0.5, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False},
-        'output': {'lr_scale': 0.3, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False, 'gradient_clipping': 0.1},
+        'output': {'lr_scale': 0.3, 'weight_decay': 0.0, 'optimizer': 'adamw', 'grok': False, 'gradient_clipping': 0.2},
     }
 
     def __init__(self, model, base_lr=3e-4, weight_decay=0.01, gradient_clipping=1.0):
@@ -1204,19 +1228,20 @@ class MultiGrokOptimizer:
             # Priority-based component classification (biases override everything)
             if 'tau' in name:
                 component = 'tau'
-            elif 'bit_proj' in name and not name.endswith('.bias'):
-                component = 'bit_proj'
+            elif 'bit_extract' in name or 'embed_proj' in name:
+              # Bit projection layers get their own treatment
+              component = 'bit_proj' if not name.endswith('.bias') else 'biases'
             elif name.endswith('.bias'):
                 component = 'biases'
             elif 'norm' in name or 'scale' in name or 'shift' in name:
                 component = 'layer_norm'
-            elif any(x in name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'in_proj', 'out_proj']):
+            elif any(x in name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'in_proj', 'out_proj', 'xor_weight', 'bit_weight']):
                 component = 'attention'
             elif any(x in name for x in ['fc1', 'fc2', 'fc3', 'ffn']):
                 component = 'ffn'
             elif 'out' in name:
                 component = 'output'
-            elif 'embedding' in name or 'offset_embeddings' in name:
+            elif 'embedding' in name or 'offset_embeddings' in name or 'rope' in name:
                 component = 'embeddings'
             else:
                 # Default to embeddings for unmatched parameters (like position embeddings, etc.)
@@ -1662,7 +1687,7 @@ class DatasetBuilder:
             if not shard_dirs:
                 continue
             shard_datasets = [
-                PackedXORShardDataset(sd, seq_length=seq_length, stride=seq_length//2, pad_id=TriadicEncoder.PAD)
+                PackedTriadicShardDataset(sd, seq_length=seq_length, stride=seq_length//2, pad_id=TriadicEncoder.PAD)
                 for sd in shard_dirs
             ]
             if len(shard_datasets) == 1:
@@ -1676,7 +1701,7 @@ class DatasetBuilder:
         if len(ds_per_root) == 1:
             return ds_per_root[0]
 
-        return MixedPackedXORDataset(ds_per_root, policy=mixing_policy, weights=mixing_weights)
+        return MixedPackedTriadicDataset(ds_per_root, policy=mixing_policy, weights=mixing_weights)
 
     def create_datasets_and_loaders(self, encoder, data_path, val_path, packed_dirs, val_packed_dirs,
                                    seq_length, batch_size, mixing_policy, mixing_weights):
@@ -1784,6 +1809,7 @@ class CurriculumManager:
     def __init__(self, dataset_builder: DatasetBuilder, seq_length: int, batch_size: int,
                  mixing_policy: str, mixing_weights: Optional[List[float]]):
         self.dataset_builder = dataset_builder
+        self.encoder = None  # will be set by constructor in train()
         self.seq_length = seq_length
         self.batch_size = batch_size
         self.mixing_policy = mixing_policy
@@ -1804,7 +1830,7 @@ class CurriculumManager:
 
             # Create datasets and loaders for this stage
             stage_train_loader, stage_val_loader = self.dataset_builder.create_curriculum_datasets_and_loaders(
-                stage, self.seq_length, self.batch_size, self.mixing_policy, self.mixing_weights
+                self.encoder, stage, self.seq_length, self.batch_size, self.mixing_policy, self.mixing_weights
             )
 
             # Run the stage
@@ -1830,8 +1856,11 @@ class StageRunner:
             # Freeze lower layers and bit projection
             n_freeze = int(len(self.model.layers) * 0.8)  # Freeze 60% of layers
 
-            # Freeze bit projection
-            self.model.bit_proj.weight.requires_grad = False
+            # Freeze input projection stack (align with current module names)
+            for p in self.model.bit_extract.parameters():
+                p.requires_grad = False
+            for p in self.model.embed_proj.parameters():
+                p.requires_grad = False
 
             # Freeze RoPE (positional encoding)
             for param in self.model.rope.parameters():
@@ -1901,6 +1930,12 @@ class StageRunner:
                     'perplexity/ema': trainer.metrics.perp_ema,
                     'grok': trainer.metrics.get_signal()
                 })
+
+                if global_step % 1000 == 0:
+                    self.model.eval()
+                    sample = self.model.generate(self.test_prompt, max_len=60)
+                    print(f"\nSample ({stage_name}): {sample}\n")
+                    self.model.train()
 
                 if steps is not None and global_step >= int(steps):
                     print(f"[stage] {stage_name}: reached step cap ({global_step}/{int(steps)}); ending stage after summary.")
@@ -1982,7 +2017,7 @@ def train(
         # Track hyperparameters and run metadata.
         config={
             "learning_rate": lr,
-            "architecture": "MesicapLM",
+            "architecture": "MesicapResonance",
             "epochs": epochs,
             "d_model": d_model,
             "n_heads": n_heads,
@@ -2008,6 +2043,7 @@ def train(
     # Create helper classes
     dataset_builder = DatasetBuilder(device)
     curriculum_manager = CurriculumManager(dataset_builder, seq_length, batch_size, mixing_policy, mixing_weights)
+    curriculum_manager.encoder = encoder
     stage_runner = StageRunner(
         model, device, eval_interval, ema_alpha, test_prompt, model_path, run
     )
@@ -2053,7 +2089,7 @@ if __name__ == "__main__":
 
     test_run = True
     load_and_test = False
-    test_run_shakespeare = True
+    test_run_shakespeare = False
 
     if load_and_test:
         model = load_model("xor_model", "mps")
@@ -2077,10 +2113,11 @@ if __name__ == "__main__":
                 "data/tiny_shakespeare.txt",
                 seq_length=512,
                 batch_size=8,
-                epochs=5,
-                d_model=512,
+                lr=0.0003,
+                epochs=15,
+                d_model=128,
                 n_heads=8,
-                n_layers=8,
+                n_layers=6,
                 rope_base=10000,
                 test_prompt="The "
             )
@@ -2106,7 +2143,7 @@ if __name__ == "__main__":
                 {
                     'name': 'pretrain',
                     'packed_roots': [
-                        'datasets/packed/tiny-stories-512',
+                        'datasets/packed/triadic-tiny-stories-512',
                     ],
                     'epochs': 1,
                     #'steps': 1500,
