@@ -347,8 +347,8 @@ def create_moe_kernels():
     """
     return torch.mps.compile_shader(kernel_source)
 
-#@torch.compile
-class OptimizedMoEFeedForward(nn.Module):
+
+class MoEFeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.num_experts_per_tok = cfg["num_experts_per_tok"]
@@ -475,83 +475,6 @@ class OptimizedMoEFeedForward(nn.Module):
             return self.fc3[expert_id](hidden)
         return forward
 
-class MoEFeedForward(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.num_experts_per_tok = cfg["num_experts_per_tok"]
-        self.num_experts = cfg["num_experts"]
-        self.emb_dim = cfg["emb_dim"]
-        self.gate = nn.Linear(cfg["emb_dim"], cfg["num_experts"], bias=False, dtype=cfg["dtype"])
-
-        self.fc1 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"])
-                                  for _ in range(cfg["num_experts"])])
-        self.fc2 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"])
-                                  for _ in range(cfg["num_experts"])])
-        self.fc3 = nn.ModuleList([nn.Linear(cfg["moe_intermediate_size"], cfg["emb_dim"], bias=False, dtype=cfg["dtype"])
-                                  for _ in range(cfg["num_experts"])])
-
-    def forward(self, x):
-        scores = self.gate(x)  # (b, seq_len, num_experts)
-        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
-        topk_probs = torch.softmax(topk_scores, dim=-1)
-
-        batch, seq_len, _ = x.shape
-        x_flat = x.reshape(batch * seq_len, -1)
-        out_flat = torch.zeros(batch * seq_len, self.emb_dim, device=x.device, dtype=x.dtype)
-
-        topk_indices_flat = topk_indices.reshape(-1, self.num_experts_per_tok)
-        topk_probs_flat = topk_probs.reshape(-1, self.num_experts_per_tok)
-
-        unique_experts = torch.unique(topk_indices_flat)
-
-        for expert_id_tensor in unique_experts:
-            expert_id = int(expert_id_tensor.item())
-            mask = topk_indices_flat == expert_id
-            if not mask.any():
-                continue
-
-            token_mask = mask.any(dim=-1)
-            selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
-            if selected_idx.numel() == 0:
-                continue
-
-            expert_input = x_flat.index_select(0, selected_idx)
-            hidden = torch.nn.functional.silu(self.fc1[expert_id](expert_input)) * self.fc2[expert_id](expert_input)
-            expert_out = self.fc3[expert_id](hidden)
-
-            mask_selected = mask[selected_idx]
-            slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)
-            selected_probs = torch.gather(topk_probs_flat.index_select(0, selected_idx), dim=-1, index=slot_indices).squeeze(-1)
-
-            out_flat.index_add_(0, selected_idx, expert_out * selected_probs.unsqueeze(-1))
-
-        return out_flat.reshape(batch, seq_len, self.emb_dim)
-
-"""
-class RMSNorm(nn.Module):
-    def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
-        super().__init__()
-        self.eps = eps
-        self.qwen3_compatible = qwen3_compatible
-        self.scale = nn.Parameter(torch.ones(emb_dim))
-        self.shift = nn.Parameter(torch.zeros(emb_dim)) if bias else None
-
-    def forward(self, x):
-        input_dtype = x.dtype
-
-        if self.qwen3_compatible:
-            x = x.to(torch.float32)
-
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        norm_x = x * torch.rsqrt(variance + self.eps)
-        norm_x = norm_x * self.scale
-
-        if self.shift is not None:
-            norm_x = norm_x + self.shift
-
-        return norm_x.to(input_dtype)
-"""
-
 
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
@@ -576,24 +499,21 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
 
 
 def apply_rope(x, cos, sin):
-    # x: (batch_size, num_heads, seq_len, head_dim)
+    # Avoid splitting and concatenating
     batch_size, num_heads, seq_len, head_dim = x.shape
-    assert head_dim % 2 == 0, "Head dimension must be even"
 
-    # Split x into first half and second half
-    x1 = x[..., : head_dim // 2]  # First half
-    x2 = x[..., head_dim // 2 :]  # Second half
+    # Use complex number rotation (much faster)
+    x_complex = x.float().reshape(batch_size, num_heads, seq_len, head_dim // 2, 2)
+    x_complex = torch.view_as_complex(x_complex)
 
-    # Adjust sin and cos shapes
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    cos = cos[:seq_len, :head_dim // 2].unsqueeze(0).unsqueeze(0)
+    sin = sin[:seq_len, :head_dim // 2].unsqueeze(0).unsqueeze(0)
+    freqs_complex = torch.complex(cos, sin)
 
-    # Apply the rotary transformation
-    rotated = torch.cat((-x2, x1), dim=-1)
-    x_rotated = (x * cos) + (rotated * sin)
+    x_rotated = x_complex * freqs_complex
+    x_rotated = torch.view_as_real(x_rotated).reshape(batch_size, num_heads, seq_len, head_dim)
 
-    # It's ok to use lower-precision after applying cos and sin rotation
-    return x_rotated.to(dtype=x.dtype)
+    return x_rotated.to(x.dtype)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -673,17 +593,7 @@ class TransformerBlock(nn.Module):
             dtype=cfg["dtype"]
         )
         if cfg["num_experts"] > 0:
-            use_metal = bool(cfg.get("use_metal_moe_dispatch", False))
-            if use_metal:
-                self.ff = OptimizedMoEFeedForward(cfg)
-                if not cfg.get("_moe_path_printed", False):
-                    print("[MoE] Using Metal-dispatch MoE path")
-                    cfg["_moe_path_printed"] = True
-            else:
-                self.ff = MoEFeedForward(cfg)
-                if not cfg.get("_moe_path_printed", False):
-                    print("[MoE] Using Python MoE path (Metal dispatch disabled)")
-                    cfg["_moe_path_printed"] = True
+            self.ff = MoEFeedForward(cfg)
         else:
             self.ff = FeedForward(cfg)
         self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
@@ -758,7 +668,7 @@ class MesicapLM(nn.Module):
 
         if len(input_token_ids) > 0 and input_token_ids[-1] == self.encoder.END:
             input_token_ids = input_token_ids[:-1]
-        x = input_token_ids.detach().clone().unsqueeze(0).to(device)
+        x = input_token_ids.detach().clone().unsqueeze(0).to(device, non_blocking=True)
 
         # Simple generation without cache
         for _ in range(max_len):
@@ -1194,7 +1104,7 @@ class Trainer:
             eval_batches = itertools.islice(eval_batches, max_batches)
 
         for i, batch in eval_batches:
-            batch = batch.to(self.device)
+            batch = batch.to(self.device, non_blocking=True)
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
 
@@ -1237,9 +1147,9 @@ class Trainer:
         """Unpack batch tuple (tokens, loss_mask) or return tensor directly."""
         if isinstance(batch, (list, tuple)) and len(batch) == 2:
             tokens, loss_mask = batch
-            return tokens.to(self.device), loss_mask.to(self.device)
+            return tokens.to(self.device), loss_mask.to(self.device, non_blocking=True)
         else:
-            return batch.to(self.device), None
+            return batch.to(self.device, non_blocking=True), None
 
     def train_step(self, batch: torch.Tensor) -> float:
         """Single training step with mixed precision."""
@@ -1806,8 +1716,6 @@ def train(
         "num_experts": 2,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": d_model,
-        # Feature flag: use Python MoE path by default to avoid Metal shader compile issues
-        "use_metal_moe_dispatch": True,
     }
 
     # Create model once and reuse across stages
