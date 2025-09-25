@@ -1,1 +1,5 @@
-# This file makes the 'mps_example' directory a Python package.
+from .power_attention import mps_power_attention
+
+__all__ = [
+    'mps_power_attention',
+]

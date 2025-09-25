@@ -61,13 +61,13 @@ def bench_power_attention_phi2(b, h, t, d, warmup=10, iters=50):
         # Compute state via batched einsum-like: sum_t phi_k[...,t,:]^T * v[...,t,:]
         # Implement with matmul by reshaping: (B*H, T, C) and (B*H, T, D)
         bh = b * h
-        phi_k_2d = phi_k.contiguous().view(bh, t, c)
-        v_2d = v.contiguous().view(bh, t, d)
+        phi_k_2d = phi_k.reshape(bh, t, c)
+        v_2d = v.reshape(bh, t, d)
         # state: (bh, C, D)
         state = torch.matmul(phi_k_2d.transpose(1, 2), v_2d)
         # output: (bh, T, D) = (bh, T, C) @ (bh, C, D)
-        out = torch.matmul(phi_q.contiguous().view(bh, t, c), state)
-        return out.view(b, h, t, d)
+        out = torch.matmul(phi_q.reshape(bh, t, c), state)
+        return out.reshape(b, h, t, d)
 
     # warmup
     for _ in range(warmup):
@@ -183,8 +183,8 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
             return local_out, local_norm
         else:
             # Compute φ2 and fall back to matmul-based φ2 path
-            phi_q_bh = phi.expand(q_bh.view(b, h, L, d)).contiguous().view(BH, L, c)
-            phi_k_bh = phi.expand(k_bh.view(b, h, L, d)).contiguous().view(BH, L, c)
+            phi_q_bh = phi.expand(q_bh.view(b, h, L, d)).reshape(BH, L, c)
+            phi_k_bh = phi.expand(k_bh.view(b, h, L, d)).reshape(BH, L, c)
             return _local_intra_phi(phi_q_bh, phi_k_bh, v_bh)
 
     def run():
@@ -210,9 +210,9 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
                 k_ch = k[:, :, start:end]
                 v_ch = v[:, :, start:end]
 
-                q_bh = q_ch.contiguous().view(BH, L, d)
-                k_bh = k_ch.contiguous().view(BH, L, d)
-                v_bh = v_ch.contiguous().view(BH, L, d)
+                q_bh = q_ch.reshape(BH, L, d)
+                k_bh = k_ch.reshape(BH, L, d)
+                v_bh = v_ch.reshape(BH, L, d)
 
                 if use_fused_update:
                     state_i = torch.zeros(BH, c, d, device=device, dtype=torch.float32)
@@ -221,7 +221,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
 
                     # Check
                     phi_k = phi.expand(k_ch)
-                    phi_k_bh = phi_k.contiguous().view(BH, L, c)
+                    phi_k_bh = phi_k.reshape(BH, L, c)
                     expected_state = torch.matmul(phi_k_bh.transpose(1, 2), v_bh)
                     expected_norm = phi_k_bh.sum(dim=1)
                     assert torch.allclose(state_i, expected_state, atol=1e-3, rtol=1e-3)
@@ -229,7 +229,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
                     print(f"Fused update matches for chunk {chunk_idx}")
                 else:
                     phi_k = phi.expand(k_ch)
-                    phi_k_bh = phi_k.contiguous().view(BH, L, c)
+                    phi_k_bh = phi_k.reshape(BH, L, c)
                     state_i = torch.matmul(phi_k_bh.transpose(1, 2), v_bh)
                     norm_i = phi_k_bh.sum(dim=1)
 
@@ -240,7 +240,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
                 k_list.append(k_bh)
                 v_list.append(v_bh)
                 if not use_fused_qstate:
-                    phi_q_list.append(phi.expand(q_ch).contiguous().view(BH, L, c))
+                    phi_q_list.append(phi.expand(q_ch).reshape(BH, L, c))
 
             lambda_nbh = torch.full((n_chunks, BH), float(decay), device=device, dtype=torch.float32)
             state_acc = torch.empty_like(state_chunks)
@@ -252,7 +252,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
                 if use_qkpow2_fused:
                     local_out_bh, local_norm_bh = _local_intra_qk(q_list[chunk_idx], k_list[chunk_idx], v_list[chunk_idx])
                 else:
-                    local_out_bh, local_norm_bh = _local_intra_phi(phi_q_list[chunk_idx], phi.expand(k[:, :, chunk_idx*chunk:chunk_idx*chunk+L]).contiguous().view(BH, L, c), v_list[chunk_idx])
+                    local_out_bh, local_norm_bh = _local_intra_phi(phi_q_list[chunk_idx], phi.expand(k[:, :, chunk_idx*chunk:chunk_idx*chunk+L]).reshape(BH, L, c), v_list[chunk_idx])
 
                 state_bh_acc = state_acc[chunk_idx]
                 norm_bh_acc = norm_acc[chunk_idx]
@@ -262,7 +262,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
                     fused_q.run(q_list[chunk_idx], state_bh_acc, norm_bh_acc, out_state_bh, state_norm_bh)
 
                     # Check
-                    phi_q_check = phi_q_list[chunk_idx] if 'phi_q_list' in locals() else phi.expand(q[:, :, chunk_idx*chunk:chunk_idx*chunk + L]).contiguous().view(BH, L, c)
+                    phi_q_check = phi_q_list[chunk_idx] if 'phi_q_list' in locals() else phi.expand(q[:, :, chunk_idx*chunk:chunk_idx*chunk + L]).reshape(BH, L, c)
                     expected_out = torch.matmul(phi_q_check, state_bh_acc)
                     expected_norm_state = torch.einsum('blc,bc->bl', phi_q_check, norm_bh_acc)
                     assert torch.allclose(out_state_bh, expected_out, atol=1e-3, rtol=1e-3)
@@ -292,9 +292,9 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
             v_ch = v[:, :, start:end]
 
             BH = b * h
-            q_bh = q_ch.contiguous().view(BH, L, d)
-            k_bh = k_ch.contiguous().view(BH, L, d)
-            v_bh = v_ch.contiguous().view(BH, L, d)
+            q_bh = q_ch.reshape(BH, L, d)
+            k_bh = k_ch.reshape(BH, L, d)
+            v_bh = v_ch.reshape(BH, L, d)
 
             if use_full_fused_chunk:
                 state_bh = state.view(BH, c, d)
@@ -310,8 +310,8 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
             else:
                 phi_q = phi.expand(q_ch)
                 phi_k = phi.expand(k_ch)
-                phi_q_bh = phi_q.contiguous().view(BH, L, c)
-                phi_k_bh = phi_k.contiguous().view(BH, L, c)
+                phi_q_bh = phi_q.reshape(BH, L, c)
+                phi_k_bh = phi_k.reshape(BH, L, c)
 
                 if use_qkpow2_fused:
                     local_out_bh, local_norm_bh = _local_intra_qk(q_bh, k_bh, v_bh)
@@ -360,7 +360,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
 
                     # Check
                     phi_k = phi.expand(k_ch)
-                    phi_k_bh = phi_k.contiguous().view(BH, L, c)
+                    phi_k_bh = phi_k.reshape(BH, L, c)
                     added_state = torch.matmul(phi_k_bh.transpose(1, 2), v_bh)
                     added_norm = phi_k_bh.sum(dim=1)
                     expected_state = old_state * decay_bh.view(BH, 1, 1) + added_state
@@ -370,7 +370,7 @@ def bench_power_attention_phi2_chunked(b, h, t, d, chunk, decay=1.0, warmup=5, i
                     print(f"Fused update matches for chunk {chunk_idx}")
                 else:
                     phi_k = phi.expand(k_ch)
-                    phi_k_bh = phi_k.contiguous().view(BH, L, c)
+                    phi_k_bh = phi_k.reshape(BH, L, c)
                     updater.update_bh(phi_k_bh, v_bh, state_bh, norm_bh, decay_bh)
 
         return torch.cat(outputs, dim=2)
