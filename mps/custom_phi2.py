@@ -415,9 +415,15 @@ class FullFusedChunk:
 
     def __init__(self, head_dim: int, d_tile: int = 32, normalized: bool = True):
         self.head_dim = int(head_dim)
-        self.intra_inter = IntraInterFusedChunk(head_dim, d_tile=d_tile, normalized=normalized)
+        self.mode = os.environ.get('MPS_FULLFUSED_MODE', 'intra_inter')  # 'intra_inter' (default) or 'compose'
+        if self.mode == 'compose':
+            self.local = QKPow2IntraFused()
+            self.qstate = FusedQueryState(head_dim, d_tile=d_tile, normalized=normalized)
+        else:
+            self.intra_inter = IntraInterFusedChunk(head_dim, d_tile=d_tile, normalized=normalized)
         self.updater = FusedUpdateState(head_dim, d_tile=d_tile, normalized=normalized)
         self.phi = Phi2FeatureMap(head_dim, normalized)
+        self.eps = 1e-6
 
     def run(
         self,
@@ -431,8 +437,24 @@ class FullFusedChunk:
     ) -> None:
         assert all(t.is_mps for t in (q_bh, k_bh, v_bh, state_bh, norm_bh, out_bh)), "All tensors must be on MPS"
 
-        # 1) Compute outputs with current state snapshot
-        self.intra_inter.run(q_bh, k_bh, v_bh, state_bh, norm_bh, out_bh)
+        if self.mode == 'compose':
+            BH, L, D = q_bh.shape
+            # 1) Local intra-chunk: (q·k)^2 fused
+            local_out = torch.empty(BH, L, D, device=q_bh.device, dtype=q_bh.dtype)
+            local_norm = torch.empty(BH, L, device=q_bh.device, dtype=q_bh.dtype)
+            self.local.run(q_bh, k_bh, v_bh, local_out, local_norm)
+
+            # 2) Inter-chunk: query current state via fused qstate
+            out_state = torch.empty(BH, L, D, device=q_bh.device, dtype=q_bh.dtype)
+            state_norm = torch.empty(BH, L, device=q_bh.device, dtype=q_bh.dtype)
+            self.qstate.run(q_bh, state_bh, norm_bh, out_state, state_norm)
+
+            # 3) Combine and write outputs
+            denom = (local_norm + state_norm).unsqueeze(-1)
+            out_bh.copy_((local_out + out_state) / (denom + self.eps))
+        else:
+            # Single kernel for intra+inter+normalize directly into out_bh
+            self.intra_inter.run(q_bh, k_bh, v_bh, state_bh, norm_bh, out_bh)
 
         # Optional correctness check for state update only (debug)
         do_check = os.environ.get('MPS_FUSED_CHECK', '0') == '1'

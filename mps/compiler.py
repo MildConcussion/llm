@@ -676,13 +676,68 @@ def compile_intra_inter_fused_chunk_bh(head_dim: int, d_tile: int = 32) -> any:
 
         for (int j = 0; j <= l; j++) {{
             float dot = 0.0f;
-            for (int d = 0; d < D_CONST; d++) {{
-                dot += q[bh * L * D + l * D + d] * k[bh * L * D + j * D + d];
+            int q_off = bh * L * D + l * D;
+            int k_off = bh * L * D + j * D;
+            if ((D_CONST & 3) == 0) {{
+                int D4 = D_CONST >> 2;
+                const device float4* q4 = reinterpret_cast<const device float4*>(q + q_off);
+                const device float4* k4 = reinterpret_cast<const device float4*>(k + k_off);
+                int t = 0;
+                for (; t + 1 < D4; t += 2) {{
+                    float4 a0 = q4[t];
+                    float4 b0 = k4[t];
+                    float4 p0 = a0 * b0;
+                    dot += (p0.x + p0.y + p0.z + p0.w);
+                    float4 a1 = q4[t + 1];
+                    float4 b1 = k4[t + 1];
+                    float4 p1 = a1 * b1;
+                    dot += (p1.x + p1.y + p1.z + p1.w);
+                }}
+                if (t < D4) {{
+                    float4 a = q4[t];
+                    float4 b = k4[t];
+                    float4 prod = a * b;
+                    dot += (prod.x + prod.y + prod.z + prod.w);
+                }}
+            }} else {{
+                for (int d = 0; d < D_CONST; d++) {{
+                    dot += q[q_off + d] * k[k_off + d];
+                }}
             }}
             float w = dot * dot;
             acc_norm_local += w;
-            for (int dv = 0; dv < D_CONST; dv++) {{
-                acc_local[dv] += w * v[bh * L * D + j * D + dv];
+            int v_row = bh * L * D + j * D;
+            if ((D_CONST & 3) == 0) {{
+                int D4 = D_CONST >> 2;
+                const device float4* v4 = reinterpret_cast<const device float4*>(v + v_row);
+                int t = 0;
+                for (; t + 1 < D4; ++t) {{
+                    float4 vv0 = v4[t];
+                    int base0 = t * 4;
+                    acc_local[base0 + 0] += w * vv0.x;
+                    acc_local[base0 + 1] += w * vv0.y;
+                    acc_local[base0 + 2] += w * vv0.z;
+                    acc_local[base0 + 3] += w * vv0.w;
+                    float4 vv1 = v4[t + 1];
+                    int base1 = (t + 1) * 4;
+                    acc_local[base1 + 0] += w * vv1.x;
+                    acc_local[base1 + 1] += w * vv1.y;
+                    acc_local[base1 + 2] += w * vv1.z;
+                    acc_local[base1 + 3] += w * vv1.w;
+                    ++t; /* manual unroll: processed two */
+                }}
+                if (t < D4) {{
+                    float4 vv = v4[t];
+                    int base = t * 4;
+                    acc_local[base + 0] += w * vv.x;
+                    acc_local[base + 1] += w * vv.y;
+                    acc_local[base + 2] += w * vv.z;
+                    acc_local[base + 3] += w * vv.w;
+                }}
+            }} else {{
+                for (int dv = 0; dv < D_CONST; dv++) {{
+                    acc_local[dv] += w * v[v_row + dv];
+                }}
             }}
         }}
 
@@ -700,30 +755,116 @@ def compile_intra_inter_fused_chunk_bh(head_dim: int, d_tile: int = 32) -> any:
             int tile_size = tile_end - tile_start;
 
             for (int row = 0; row < tile_size; row++) {{
-                for (int col = row; col < tile_size; col++) {{
+                int col = row;
+                for (; col + 1 < tile_size; col += 2) {{
+                    int i0 = tile_start + row;
+                    int j0 = tile_start + col;
+                    int j1 = tile_start + (col + 1);
+
+                    float f0 = (row == col) ? 1.0f : sqrt(2.0f);
+                    float f1 = (row == (col + 1)) ? 1.0f : sqrt(2.0f);
+
+                    float qi0 = q[bh * L * D + l * D + i0];
+                    float qj0 = q[bh * L * D + l * D + j0];
+                    float qi1 = qi0; // same i (row) for this row
+                    float qj1 = q[bh * L * D + l * D + j1];
+
+                    float prod0 = qi0 * qj0 * f0;
+                    float prod1 = qi1 * qj1 * f1;
+
+                    int cc0 = tile_c_off + row * tile_size - row * (row - 1) / 2 + (col - row);
+                    int cc1 = cc0 + 1; // next along the triangular sequence within the row
+
+                    acc_norm_inter += prod0 * norm_state[bh * C + cc0];
+                    acc_norm_inter += prod1 * norm_state[bh * C + cc1];
+
+                    int st_row0 = bh * C * D + cc0 * D;
+                    int st_row1 = bh * C * D + cc1 * D;
+                    if ((D_CONST & 3) == 0) {{
+                        int D4 = D_CONST >> 2;
+                        const device float4* st40 = reinterpret_cast<const device float4*>(state + st_row0);
+                        const device float4* st41 = reinterpret_cast<const device float4*>(state + st_row1);
+                        int t = 0;
+                        for (; t + 1 < D4; t += 2) {{
+                            float4 sv00 = st40[t];
+                            float4 sv01 = st41[t];
+                            int base0 = t * 4;
+                            acc_inter[base0 + 0] += prod0 * sv00.x + prod1 * sv01.x;
+                            acc_inter[base0 + 1] += prod0 * sv00.y + prod1 * sv01.y;
+                            acc_inter[base0 + 2] += prod0 * sv00.z + prod1 * sv01.z;
+                            acc_inter[base0 + 3] += prod0 * sv00.w + prod1 * sv01.w;
+
+                            float4 sv10 = st40[t + 1];
+                            float4 sv11 = st41[t + 1];
+                            int base1 = (t + 1) * 4;
+                            acc_inter[base1 + 0] += prod0 * sv10.x + prod1 * sv11.x;
+                            acc_inter[base1 + 1] += prod0 * sv10.y + prod1 * sv11.y;
+                            acc_inter[base1 + 2] += prod0 * sv10.z + prod1 * sv11.z;
+                            acc_inter[base1 + 3] += prod0 * sv10.w + prod1 * sv11.w;
+                        }}
+                        if (t < D4) {{
+                            float4 sv0 = st40[t];
+                            float4 sv1 = st41[t];
+                            int base = t * 4;
+                            acc_inter[base + 0] += prod0 * sv0.x + prod1 * sv1.x;
+                            acc_inter[base + 1] += prod0 * sv0.y + prod1 * sv1.y;
+                            acc_inter[base + 2] += prod0 * sv0.z + prod1 * sv1.z;
+                            acc_inter[base + 3] += prod0 * sv0.w + prod1 * sv1.w;
+                        }}
+                    }} else {{
+                        for (int dd = 0; dd < D_CONST; dd++) {{
+                            acc_inter[dd] += prod0 * state[st_row0 + dd] + prod1 * state[st_row1 + dd];
+                        }}
+                    }}
+                }}
+                if (col < tile_size) {{
                     int i = tile_start + row;
                     int j = tile_start + col;
                     float f = (row == col) ? 1.0f : sqrt(2.0f);
-
                     float qi = q[bh * L * D + l * D + i];
                     float qj = q[bh * L * D + l * D + j];
                     float prod = qi * qj * f;
-
                     int cc = tile_c_off + row * tile_size - row * (row - 1) / 2 + (col - row);
                     acc_norm_inter += prod * norm_state[bh * C + cc];
-
-                    for (int dd = 0; dd < D_CONST; dd++) {{
-                        acc_inter[dd] += prod * state[bh * C * D + cc * D + dd];
+                    int st_row = bh * C * D + cc * D;
+                    if ((D_CONST & 3) == 0) {{
+                        int D4 = D_CONST >> 2;
+                        const device float4* st4 = reinterpret_cast<const device float4*>(state + st_row);
+                        for (int t = 0; t < D4; ++t) {{
+                            float4 sv = st4[t];
+                            int base = t * 4;
+                            acc_inter[base + 0] += prod * sv.x;
+                            acc_inter[base + 1] += prod * sv.y;
+                            acc_inter[base + 2] += prod * sv.z;
+                            acc_inter[base + 3] += prod * sv.w;
+                        }}
+                    }} else {{
+                        for (int dd = 0; dd < D_CONST; dd++) {{
+                            acc_inter[dd] += prod * state[st_row + dd];
+                        }}
                     }}
                 }}
             }}
             tile_c_off += tile_size * (tile_size + 1) / 2;
         }}
 
-        // Combine and output
+        // Combine and output (vectorized when possible)
         float denom = acc_norm_local + acc_norm_inter + 1e-6f;
-        for (int dv = 0; dv < D_CONST; dv++) {{
-            out[bh * L * D + l * D + dv] = (acc_local[dv] + acc_inter[dv]) / denom;
+        if ((D_CONST & 3) == 0) {{
+            float inv = 1.0f / denom;
+            int D4 = D_CONST >> 2;
+            int out_row = bh * L * D + l * D;
+            for (int t = 0; t < D4; ++t) {{
+                int base = t * 4;
+                out[out_row + base + 0] = (acc_local[base + 0] + acc_inter[base + 0]) * inv;
+                out[out_row + base + 1] = (acc_local[base + 1] + acc_inter[base + 1]) * inv;
+                out[out_row + base + 2] = (acc_local[base + 2] + acc_inter[base + 2]) * inv;
+                out[out_row + base + 3] = (acc_local[base + 3] + acc_inter[base + 3]) * inv;
+            }}
+        }} else {{
+            for (int dv = 0; dv < D_CONST; dv++) {{
+                out[bh * L * D + l * D + dv] = (acc_local[dv] + acc_inter[dv]) / denom;
+            }}
         }}
     }}
     """

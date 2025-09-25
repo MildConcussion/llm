@@ -1,0 +1,21 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+unapollo_*
+v2_output/
+tokenizer.py
+old/
+tokenized_*
+processed_*
+*.vocab
+*.model
+*.bin
+*.json
+*.txt
+*.pth
+*.pt
+*.pkl
+*.joblib
+*.model
+*.pt
+*.vocab
+*.arrow
+wandb/

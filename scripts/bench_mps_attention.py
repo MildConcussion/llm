@@ -455,9 +455,9 @@ def main():
     profile_ctx = torch.mps.profiler.profile() if use_signpost else contextlib.nullcontext()
 
     for seq in args.t:
-        with profile_ctx:
-            ms_sdpa, tok_s_sdpa = bench_sdpa(args.b, args.h, seq, args.d, args.warmup, args.iters)
-        print(f"SDPA:   T={seq:6d}  latency={ms_sdpa:8.2f} ms  throughput={tok_s_sdpa:10.2f} tok/s")
+        #with profile_ctx:
+        #    ms_sdpa, tok_s_sdpa = bench_sdpa(args.b, args.h, seq, args.d, args.warmup, args.iters)
+        #print(f"SDPA:   T={seq:6d}  latency={ms_sdpa:8.2f} ms  throughput={tok_s_sdpa:10.2f} tok/s")
 
         with profile_ctx:
             ms_pow, tok_s_pow, c = bench_power_attention_phi2(args.b, args.h, seq, args.d, args.warmup, args.iters)

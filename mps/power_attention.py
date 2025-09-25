@@ -40,19 +40,32 @@ def mps_power_attention(
     )
 
     if unsupported or (q.dtype != torch.float32) or (k.dtype != torch.float32) or (v.dtype != torch.float32):
+        print(f"[mps_power_attention][warn] unsupported conditions: {unsupported}")
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
     if not (q.is_mps and k.is_mps and v.is_mps):
+        print(f"[mps_power_attention][warn] non-MPS tensors: {q.device}, {k.device}, {v.device}")
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "Expected q,k,v with shape [B,H,T,D]"
     b, h, t, d = q.shape
     assert k.shape == (b, h, t, d) and v.shape == (b, h, t, d), "q,k,v must have matching [B,H,T,D]"
 
-    # Chunk default
+    # Chunk default with heuristic + env override
     if chunk is None:
-        # Reasonable default chunk; small enough to keep register/memory pressure low on MPS
-        chunk = 128
+        env_chunk = os.environ.get('MPS_CHUNK')
+        if env_chunk:
+            try:
+                chunk = int(env_chunk)
+            except Exception:
+                chunk = None
+        if chunk is None:
+            if d <= 64:
+                chunk = min(512, t)
+            elif d <= 128:
+                chunk = min(768, t)
+            else:
+                chunk = min(256, t)
 
     # Allocate state and output tensors
     c = int(Phi2FeatureMap(d, normalized=normalized).out_dim)
@@ -76,19 +89,18 @@ def mps_power_attention(
         k_ch = k[:, :, start:end]
         v_ch = v[:, :, start:end]
 
-        q_bh = q_ch.reshape(BH, L, d)
-        k_bh = k_ch.reshape(BH, L, d)
-        v_bh = v_ch.reshape(BH, L, d)
+        # Ensure BH views are contiguous once per chunk to avoid repeated internal copies in kernels
+        q_bh = q_ch.reshape(BH, L, d).contiguous()
+        k_bh = k_ch.reshape(BH, L, d).contiguous()
+        v_bh = v_ch.reshape(BH, L, d).contiguous()
 
         state_bh = state.reshape(BH, c, d)
         norm_bh = norm_state.reshape(BH, c)
         out_bh = out[:, :, start:end].reshape(BH, L, d)
         decay_bh = torch.full((BH,), float(decay), device=q.device, dtype=q.dtype)
 
-        if debug_copies:
-            # Print minimal diagnostics about contiguity
-            if not (q_bh.is_contiguous() and k_bh.is_contiguous() and v_bh.is_contiguous()):
-                print(f"[mps_power_attention][debug] non-contiguous BH views at chunk {chunk_idx}")
+        if debug_copies and (not (q_bh.is_contiguous() and k_bh.is_contiguous() and v_bh.is_contiguous())):
+            print(f"[mps_power_attention][debug] non-contiguous BH views at chunk {chunk_idx}")
 
         full.run(q_bh, k_bh, v_bh, state_bh, norm_bh, decay_bh, out_bh)
 
