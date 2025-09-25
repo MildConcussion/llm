@@ -22,7 +22,6 @@ from triadic_packed import ensure_train_val_split, build_mixed_dataset
 from triadic_packed import build_capped_mixed_dataset
 from triadictokenizer import TriadicEncoder
 from torch.nn import RMSNorm
-from mps.custom_phi2 import Phi2FeatureMap, QueryStatePhi2, QKPow2IntraFused, DiscumSumState
 
 import os
 import wandb
@@ -550,7 +549,7 @@ def apply_rope(x, cos, sin):
 
 class GroupedQueryAttention(nn.Module):
     def __init__(
-        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None, attn_impl: str = "sdpa"
+        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
     ):
         super().__init__()
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
@@ -578,14 +577,6 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.q_norm = self.k_norm = None
 
-        # Power Attention plumbing (MPS-only path)
-        self.attn_impl = attn_impl
-        self._pa_qkpow = QKPow2IntraFused()
-        self._pa_qstate = QueryStatePhi2()
-        self._pa_phi = Phi2FeatureMap(head_dim)
-        self._pa_discum = DiscumSumState()
-        self._pa_chunk = 128
-
     def forward(self, x, mask, cos, sin):
         b, num_tokens, _ = x.shape
 
@@ -612,72 +603,6 @@ class GroupedQueryAttention(nn.Module):
         # Expand K and V to match number of heads
         keys = keys.repeat_interleave(self.group_size, dim=1)
         values = values.repeat_interleave(self.group_size, dim=1)
-
-        if self.attn_impl == "power2" and torch.backends.mps.is_available() and x.is_mps:
-            # Power Attention (p=2) on MPS: qkpow2 intra + discumsum + fused qstate
-            device = x.device
-            bsz, n_heads, L, D = queries.shape
-            BH = bsz * n_heads
-            chunk = self._pa_chunk
-            n_chunks = (L + chunk - 1) // chunk
-
-            # Prepare per-chunk accumulators
-            # State over φ2(K): (C,D)
-            cdim = self._pa_phi.out_dim
-            state_chunks = torch.empty(n_chunks, BH, cdim, D, device=device, dtype=queries.dtype)
-            norm_chunks = torch.empty(n_chunks, BH, cdim, device=device, dtype=queries.dtype)
-
-            q_list = []
-            k_list = []
-            v_list = []
-            phi_q_list = []
-
-            for ci in range(n_chunks):
-                s = ci * chunk
-                e = min(s + chunk, L)
-                Li = e - s
-                q_i = queries[:, :, s:e, :].contiguous().view(BH, Li, D)
-                k_i = keys[:, :, s:e, :].contiguous().view(BH, Li, D)
-                v_i = values[:, :, s:e, :].contiguous().view(BH, Li, D)
-
-                # φ2(K) for state update
-                phi_k = self._pa_phi.expand(keys[:, :, s:e, :]).contiguous().view(BH, Li, cdim)
-                state_i = torch.matmul(phi_k.transpose(1, 2), v_i)
-                norm_i = phi_k.sum(dim=1)
-                state_chunks[ci] = state_i
-                norm_chunks[ci] = norm_i
-
-                q_list.append(q_i)
-                k_list.append(k_i)
-                v_list.append(v_i)
-                phi_q_list.append(self._pa_phi.expand(queries[:, :, s:e, :]).contiguous().view(BH, Li, cdim))
-
-            # Discounted prefix-sum λ=1.0 (no discount by default)
-            lam = torch.ones(n_chunks, BH, device=device, dtype=queries.dtype)
-            state_acc = torch.empty_like(state_chunks)
-            norm_acc = torch.empty_like(norm_chunks)
-            self._pa_discum.run(state_chunks, norm_chunks, lam, state_acc, norm_acc)
-
-            # Compose outputs chunk-wise
-            outs = []
-            for ci in range(n_chunks):
-                Li = q_list[ci].shape[1]
-                local_out = torch.empty(BH, Li, D, device=device, dtype=queries.dtype)
-                local_norm = torch.empty(BH, Li, device=device, dtype=queries.dtype)
-                # Intra-chunk via qkpow2 fused kernel
-                self._pa_qkpow.run(q_list[ci], k_list[ci], v_list[ci], local_out, local_norm)
-
-                # Inter-chunk via fused qstate kernel on accumulated state
-                out_state = torch.empty(BH, Li, D, device=device, dtype=queries.dtype)
-                out_norm = torch.empty(BH, Li, device=device, dtype=queries.dtype)
-                self._pa_qstate.run(phi_q_list[ci], state_acc[ci], norm_acc[ci], out_state, out_norm)
-
-                total = (local_out + out_state) / (local_norm.unsqueeze(-1) + out_norm.unsqueeze(-1) + 1e-6)
-                outs.append(total.view(bsz, n_heads, Li, D))
-
-            attn_out = torch.cat(outs, dim=2)
-            context = attn_out.transpose(1, 2).reshape(b, num_tokens, self.d_out)
-            return self.out_proj(context)
 
         # Attention (SDPA fused path on MPS)
         attn_out = F.scaled_dot_product_attention(
