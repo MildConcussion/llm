@@ -459,9 +459,14 @@ def main():
         #    ms_sdpa, tok_s_sdpa = bench_sdpa(args.b, args.h, seq, args.d, args.warmup, args.iters)
         #print(f"SDPA:   T={seq:6d}  latency={ms_sdpa:8.2f} ms  throughput={tok_s_sdpa:10.2f} tok/s")
 
-        with profile_ctx:
-            ms_pow, tok_s_pow, c = bench_power_attention_phi2(args.b, args.h, seq, args.d, args.warmup, args.iters)
-        print(f"Power2: T={seq:6d}  latency={ms_pow:8.2f} ms  throughput={tok_s_pow:10.2f} tok/s  C={c}")
+        # Skip non-chunked φ2 baseline if it would be too large in memory for MPS
+        safe = (args.b * args.h * seq * args.d) <= 256 * 1024 * 1024 // 4  # ~256MB fp32 tokens
+        if safe:
+            with profile_ctx:
+                ms_pow, tok_s_pow, c = bench_power_attention_phi2(args.b, args.h, seq, args.d, args.warmup, args.iters)
+            print(f"Power2: T={seq:6d}  latency={ms_pow:8.2f} ms  throughput={tok_s_pow:10.2f} tok/s  C={c}")
+        else:
+            print(f"Power2: T={seq:6d}  skipped (memory safety)")
 
         if args.autotune and args.run_chunked:
             print("\n[auto] Tuning chunk and BH tiling...")

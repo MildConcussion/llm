@@ -387,16 +387,28 @@ class IntraInterFusedChunk:
         C = self.phi.out_dim
         assert state_bh.shape == (BH, C, D) and norm_bh.shape == (BH, C)
         assert out_bh.shape == (BH, L, D)
-        self.lib.intra_inter_fused_chunk_bh(
-            q_bh.contiguous(),
-            k_bh.contiguous(),
-            v_bh.contiguous(),
-            state_bh,
-            norm_bh,
-            out_bh,
-            int(BH), int(L), int(D), int(C),
-            threads=(BH * L, 1, 1)
-        )
+        # Optional BH tiling for better scheduling; default to 12 if env unset
+        bh_env = int(os.environ.get('MPS_BH_BLOCK', '0'))
+        bh_block = (bh_env if bh_env > 0 else (12 if BH >= 12 else BH))
+        for start in range(0, BH, bh_block):
+            end = min(start + bh_block, BH)
+            sub_q = q_bh[start:end].contiguous()
+            sub_k = k_bh[start:end].contiguous()
+            sub_v = v_bh[start:end].contiguous()
+            sub_state = state_bh[start:end]
+            sub_norm = norm_bh[start:end]
+            sub_out = out_bh[start:end]
+            sub_BH = end - start
+            self.lib.intra_inter_fused_chunk_bh(
+                sub_q,
+                sub_k,
+                sub_v,
+                sub_state,
+                sub_norm,
+                sub_out,
+                int(sub_BH), int(L), int(D), int(C),
+                threads=(sub_BH * L, 1, 1)
+            )
 
 
 class FullFusedChunk:

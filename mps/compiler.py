@@ -525,51 +525,43 @@ def compile_fused_update_state_phi2_bh(head_dim: int, d_tile: int = 32) -> any:
     ) {{
         if (idx >= BH * C) return;
         uint bh = idx / C;
-        uint global_c = idx % C;
+        uint cc = idx % C; // global basis index in [0, C)
         float dec = decay[bh];
+
+        // Map cc -> (i, j) for upper-triangular indexing over D
+        // P(i) = i*(2D - i + 1)/2, find largest i s.t. P(i) <= cc
+        float twoD_plus_1 = (float)(2 * D + 1);
+        float disc = twoD_plus_1 * twoD_plus_1 - 8.0f * (float)cc;
+        disc = max(disc, 0.0f);
+        int i = (int)floor( (twoD_plus_1 - sqrt(disc)) * 0.5f );
+        if (i < 0) i = 0;
+        if (i >= D) i = D - 1;
+        int Pi = (i * (2 * D - i + 1)) / 2; // P(i)
+        int j = i + ((int)cc - Pi);
+        if (j < i) j = i;
+        if (j >= D) j = D - 1;
+
+        float f = (i == j) ? 1.0f : 1.4142135623730951f; // sqrt(2)
 
         float acc_norm = 0.0f;
         float acc[D_CONST];
         for (int dd = 0; dd < D_CONST; dd++) acc[dd] = 0.0f;
 
-        int num_tiles = (D + TILE - 1) / TILE;
-        int tile_c_off = 0;
-
-        for (int tile = 0; tile < num_tiles; tile++) {{
-            int tile_start = tile * TILE;
-            int tile_end = min(tile_start + TILE, D);
-            int tile_size = tile_end - tile_start;
-
-            int local_c = global_c - tile_c_off;
-            if (local_c >= 0 && local_c < tile_size * (tile_size + 1) / 2) {{
-                int row = 0;
-                int col = local_c;
-                while (col >= tile_size - row) {{
-                    col -= (tile_size - row);
-                    row++;
-                }}
-                int i = tile_start + row;
-                int j = tile_start + row + col;
-                float f = (i == j) ? 1.0f : sqrt(2.0f);
-
-                for (int t = 0; t < L; t++) {{
-                    uint k_off = bh * L * D + t * D;
-                    float ki = k[k_off + i];
-                    float kj = k[k_off + j];
-                    float prod = ki * kj * f;
-                    acc_norm += prod;
-                    uint v_off = bh * L * D + t * D;
-                    for (int dd = 0; dd < D_CONST; dd++) {{
-                        acc[dd] += prod * v[v_off + dd];
-                    }}
-                }}
+        for (int t = 0; t < L; t++) {{
+            uint k_off = bh * L * D + t * D;
+            float ki = k[k_off + i];
+            float kj = k[k_off + j];
+            float prod = (ki * kj) * f;
+            acc_norm += prod;
+            uint v_off = bh * L * D + t * D;
+            for (int dd = 0; dd < D_CONST; dd++) {{
+                acc[dd] += prod * v[v_off + dd];
             }}
-            tile_c_off += tile_size * (tile_size + 1) / 2;
         }}
 
-        norm_state[bh * C + global_c] = dec * norm_state[bh * C + global_c] + acc_norm;
+        norm_state[bh * C + cc] = dec * norm_state[bh * C + cc] + acc_norm;
 
-        uint st_base = bh * C * D + global_c * D;
+        uint st_base = bh * C * D + cc * D;
         for (int dd = 0; dd < D_CONST; dd++) {{
             state[st_base + dd] = dec * state[st_base + dd] + acc[dd];
         }}
@@ -669,6 +661,12 @@ def compile_intra_inter_fused_chunk_bh(head_dim: int, d_tile: int = 32) -> any:
         uint bh = idx / L;
         uint l = idx % L;
 
+        // Constants hoisted once per thread
+        const float SQRT2 = 1.4142135623730951f;
+
+        // Precompute row offsets reused across inner loops
+        int q_row_off = bh * L * D + l * D;
+
         // Intra-chunk computation
         float acc_local[D_CONST];
         float acc_norm_local = 0.0f;
@@ -676,7 +674,7 @@ def compile_intra_inter_fused_chunk_bh(head_dim: int, d_tile: int = 32) -> any:
 
         for (int j = 0; j <= l; j++) {{
             float dot = 0.0f;
-            int q_off = bh * L * D + l * D;
+            int q_off = q_row_off;
             int k_off = bh * L * D + j * D;
             if ((D_CONST & 3) == 0) {{
                 int D4 = D_CONST >> 2;
@@ -755,31 +753,35 @@ def compile_intra_inter_fused_chunk_bh(head_dim: int, d_tile: int = 32) -> any:
             int tile_size = tile_end - tile_start;
 
             for (int row = 0; row < tile_size; row++) {{
+                // Precompute row base index in triangular indexing for this tile row
+                int row_base = tile_c_off + row * tile_size - row * (row - 1) / 2;
                 int col = row;
                 for (; col + 1 < tile_size; col += 2) {{
                     int i0 = tile_start + row;
                     int j0 = tile_start + col;
-                    int j1 = tile_start + (col + 1);
+                    int j1 = j0 + 1;
 
-                    float f0 = (row == col) ? 1.0f : sqrt(2.0f);
-                    float f1 = (row == (col + 1)) ? 1.0f : sqrt(2.0f);
+                    // f0 is 1 on diagonal, else sqrt(2); f1 always sqrt(2) for col+1 >= row+1
+                    float f0 = (col == row) ? 1.0f : SQRT2;
+                    float f1 = SQRT2;
 
-                    float qi0 = q[bh * L * D + l * D + i0];
-                    float qj0 = q[bh * L * D + l * D + j0];
-                    float qi1 = qi0; // same i (row) for this row
-                    float qj1 = q[bh * L * D + l * D + j1];
+                    float qi = q[q_row_off + i0];
+                    float qj0 = q[q_row_off + j0];
+                    float qj1 = q[q_row_off + j1];
 
-                    float prod0 = qi0 * qj0 * f0;
-                    float prod1 = qi1 * qj1 * f1;
+                    float prod0 = qi * qj0 * f0;
+                    float prod1 = qi * qj1 * f1;
 
-                    int cc0 = tile_c_off + row * tile_size - row * (row - 1) / 2 + (col - row);
-                    int cc1 = cc0 + 1; // next along the triangular sequence within the row
+                    int cc0 = row_base + (col - row);
+                    int cc1 = cc0 + 1;
 
-                    acc_norm_inter += prod0 * norm_state[bh * C + cc0];
-                    acc_norm_inter += prod1 * norm_state[bh * C + cc1];
+                    int ns_off0 = bh * C + cc0;
+                    int ns_off1 = ns_off0 + 1;
+                    acc_norm_inter += prod0 * norm_state[ns_off0];
+                    acc_norm_inter += prod1 * norm_state[ns_off1];
 
                     int st_row0 = bh * C * D + cc0 * D;
-                    int st_row1 = bh * C * D + cc1 * D;
+                    int st_row1 = st_row0 + D;
                     if ((D_CONST & 3) == 0) {{
                         int D4 = D_CONST >> 2;
                         const device float4* st40 = reinterpret_cast<const device float4*>(state + st_row0);
@@ -820,12 +822,13 @@ def compile_intra_inter_fused_chunk_bh(head_dim: int, d_tile: int = 32) -> any:
                 if (col < tile_size) {{
                     int i = tile_start + row;
                     int j = tile_start + col;
-                    float f = (row == col) ? 1.0f : sqrt(2.0f);
-                    float qi = q[bh * L * D + l * D + i];
-                    float qj = q[bh * L * D + l * D + j];
+                    float f = (col == row) ? 1.0f : SQRT2;
+                    float qi = q[q_row_off + i];
+                    float qj = q[q_row_off + j];
                     float prod = qi * qj * f;
-                    int cc = tile_c_off + row * tile_size - row * (row - 1) / 2 + (col - row);
-                    acc_norm_inter += prod * norm_state[bh * C + cc];
+                    int cc = row_base + (col - row);
+                    int ns_off = bh * C + cc;
+                    acc_norm_inter += prod * norm_state[ns_off];
                     int st_row = bh * C * D + cc * D;
                     if ((D_CONST & 3) == 0) {{
                         int D4 = D_CONST >> 2;

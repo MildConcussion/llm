@@ -67,6 +67,18 @@ def mps_power_attention(
             else:
                 chunk = min(256, t)
 
+            # Heuristic refinement by head count: if many heads, reduce per-dispatch working set
+            # Example: for D<=128 default 768 -> 512 when H>=16
+            if h >= 16:
+                old_chunk = chunk
+                if chunk >= 768:
+                    chunk = min(512, t)
+                elif chunk >= 512:
+                    # take a conservative step down for small-D path
+                    chunk = min(384, t)
+                if chunk != old_chunk:
+                    print(f"[mps_power_attention][auto] chunk adjusted for H>=16: {old_chunk} -> {chunk}")
+
     # Allocate state and output tensors
     c = int(Phi2FeatureMap(d, normalized=normalized).out_dim)
     out = torch.empty_like(q)
@@ -75,11 +87,34 @@ def mps_power_attention(
     full = FullFusedChunk(d, d_tile=d_tile, normalized=normalized)
 
     BH = b * h
+    # Proactive stability guard: auto-lower chunk on very large shapes unless disabled
+    auto_verbose = os.environ.get('MPS_AUTO_VERBOSE', '1') == '1'
+    auto_chunk_guard = os.environ.get('MPS_AUTO_CHUNK_GUARD', '1') == '1'
+    if auto_chunk_guard:
+        # Estimate working set sizes and reduce chunk if needed
+        # Rule of thumb: keep BH*C*D under ~120M elements and L under 2048 per dispatch
+        est_c = c
+        bh = b * h
+        max_elems = 120_000_000
+        max_L = 2048
+        if bh * est_c * d > max_elems or chunk > max_L:
+            old_chunk = chunk
+            # Reduce stepwise
+            if chunk > 1024:
+                chunk = 1024
+            if bh * est_c * d > max_elems and chunk > 768:
+                chunk = 768
+            if bh * est_c * d > max_elems * 2 and chunk > 512:
+                chunk = 512
+            if auto_verbose and chunk != old_chunk:
+                print(f"[mps_power_attention][auto] chunk lowered for stability: {old_chunk} -> {chunk} (BH={bh} C={est_c} D={d})")
+
     n_chunks = (t + chunk - 1) // chunk
 
     # Optional debug: report potential copies if env enabled
     debug_copies = os.environ.get('MPS_DEBUG_COPIES', '0') == '1'
 
+    prev_auto_bh = None
     for chunk_idx in range(n_chunks):
         start = chunk_idx * chunk
         end = min(start + chunk, t)
@@ -99,10 +134,27 @@ def mps_power_attention(
         out_bh = out[:, :, start:end].reshape(BH, L, d)
         decay_bh = torch.full((BH,), float(decay), device=q.device, dtype=q.dtype)
 
+        # Adaptive BH tiling if user hasn't pinned MPS_BH_BLOCK
+        # If env is set to a nonzero value, we respect it fully
+        env_bh = os.environ.get('MPS_BH_BLOCK')
+        if not env_bh or env_bh == '0':
+            auto_bh = 8 if L < 256 else (12 if L < 1024 else 16)
+            # Only set when changed to reduce env churn
+            if prev_auto_bh != auto_bh:
+                os.environ['MPS_BH_BLOCK'] = str(auto_bh)
+                prev_auto_bh = auto_bh
+                print(f"[mps_power_attention][auto] BH tiling set: L={L} -> BH_BLOCK={auto_bh}")
+
         if debug_copies and (not (q_bh.is_contiguous() and k_bh.is_contiguous() and v_bh.is_contiguous())):
             print(f"[mps_power_attention][debug] non-contiguous BH views at chunk {chunk_idx}")
 
-        full.run(q_bh, k_bh, v_bh, state_bh, norm_bh, decay_bh, out_bh)
+        # Optional kernel signpost profiling per-dispatch
+        use_signpost = bool(int(os.environ.get('MPS_PROF', '0')))
+        if use_signpost:
+            with torch.mps.profiler.profile():
+                full.run(q_bh, k_bh, v_bh, state_bh, norm_bh, decay_bh, out_bh)
+        else:
+            full.run(q_bh, k_bh, v_bh, state_bh, norm_bh, decay_bh, out_bh)
 
     return out
 
